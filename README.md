@@ -1,12 +1,54 @@
-# LYWSD02 Clock Sync (Windows)
+# LYWSD02 Clock Companion (Windows)
 
-A zero-install Windows tool that sets the time on a **Xiaomi LYWSD02 ("Mijia")
-Bluetooth clock** — the local equivalent of the web tool at
-<https://saso5.github.io/LYWSD02-clock-sync/>, but runnable unattended from
-**Task Scheduler**.
+Zero-install Windows tools for the **Xiaomi LYWSD02 ("Mijia") Bluetooth clock**:
 
-It drives Bluetooth LE through the built-in Windows Runtime APIs (via a tiny C#
-helper compiled on the fly). **No Python, no .NET SDK, no extra installs.**
+- **Set the clock's time** over Bluetooth LE (a local, scriptable equivalent of
+  the web tool at <https://saso5.github.io/LYWSD02-clock-sync/>), runnable
+  unattended from **Task Scheduler**.
+- **A system-tray widget** that shows the current temperature in the taskbar,
+  logs temperature/humidity/battery hourly to CSV, and graphs temperature,
+  humidity and dew point.
+
+Everything is plain PowerShell that drives Bluetooth LE through the built-in
+Windows Runtime (WinRT) APIs via a tiny C# helper compiled on the fly.
+**No Python, no .NET SDK, no pre-built binaries.**
+
+> Throughout this README, replace `AA:BB:CC:DD:EE:FF` with your own clock's
+> Bluetooth address (see [Quick start](#quick-start)).
+
+## Requirements
+
+- Windows 10 or 11 with a **Bluetooth LE** radio.
+- **Windows PowerShell 5.1** (built in).
+- The Windows SDK **union metadata** (`Windows.winmd`) — already present if you
+  have the Windows 10/11 SDK or Visual Studio with the Windows workload. The
+  scripts auto-detect the newest version under
+  `C:\Program Files (x86)\Windows Kits\10\UnionMetadata\`.
+- The clock must be powered and within a few metres of the PC. It advertises
+  intermittently, so wake it (press a button) when first setting things up.
+
+## Quick start
+
+```powershell
+# 1. Find your clock's Bluetooth address (press a button on the clock first).
+.\Sync-LYWSD02.ps1 -Survey
+#    Note the ADDRESS on the row whose NAME is "LYWSD02".
+
+# 2. Test a one-off time sync.
+.\Sync-LYWSD02.ps1 -Address AA:BB:CC:DD:EE:FF
+
+# 3. Install the tray widget (auto-starts at login).
+.\Install-Widget.ps1 -Address AA:BB:CC:DD:EE:FF
+
+# 4. (Optional) Schedule automatic time sync, e.g. weekly on Wednesday at noon.
+.\Install-Schedule.ps1 -Address AA:BB:CC:DD:EE:FF -Interval Weekly -DaysOfWeek Wednesday -Time 12:00
+```
+
+If you omit `-Address`, the scripts scan for the advertised name `LYWSD02`
+instead — slower and less reliable, so passing the address is recommended.
+
+The time written is **UTC + a timezone offset**; the offset defaults to this PC's
+current local offset (DST-aware) at run time, or pass `-TimezoneOffset <hours>`.
 
 ## Files
 
@@ -17,9 +59,9 @@ helper compiled on the fly). **No Python, no .NET SDK, no extra installs.**
 | `Tray-LYWSD02.ps1`   | System-tray widget (temperature in the taskbar, hourly logging, toggles). |
 | `Install-Widget.ps1` | Installs/removes the tray widget + login startup. |
 | `Start-Widget.vbs`   | Launches the widget with no console window. |
-| `settings.json`      | Widget settings (address, interval, toggles). |
-| `logs\sensors.csv`   | Hourly temperature/humidity/battery history. |
-| `logs\sync.log`, `logs\widget.log` | Run logs. |
+| `settings.json`      | Widget settings (address, interval, toggles) — generated locally, git-ignored. |
+| `logs\sensors.csv`   | Hourly temperature/humidity/battery history — generated locally, git-ignored. |
+| `logs\sync.log`, `logs\widget.log` | Run logs — generated locally, git-ignored. |
 
 ## Taskbar widget
 
@@ -27,7 +69,7 @@ A system-tray widget shows the **current temperature right in the taskbar** and
 keeps an hourly history. Install / start it with:
 
 ```powershell
-.\Install-Widget.ps1 -Address E7:2E:01:92:C1:1F
+.\Install-Widget.ps1 -Address AA:BB:CC:DD:EE:FF
 ```
 
 It adds a Startup shortcut (so it returns after reboot) and launches immediately.
@@ -62,6 +104,10 @@ As history grows the graph can get busy, so the range filter keeps it readable
 (and the X-axis labels switch between time-of-day and date automatically based on
 the visible span).
 
+Configure with `Install-Widget.ps1` parameters: `-Address`, `-IntervalMinutes`
+(default 60), `-ScanSeconds` (default 90), `-NoStartup`. Remove with
+`.\Install-Widget.ps1 -Uninstall` (keeps your CSV and settings).
+
 ### The trends graph
 
 One chart shows all three series together, with each axis colour-matched to its
@@ -87,10 +133,8 @@ row to `logs\sensors.csv`:
 
 ```
 timestamp,tempC,tempF,humidity,battery
-2026-06-06 18:50:15,22.96,73.3,46,9
+2026-01-31 18:50:15,22.96,73.3,46,87
 ```
-
-Remove it with `.\Install-Widget.ps1 -Uninstall` (keeps your CSV and settings).
 
 > **Why the system tray and not next to the weather icon?** In Windows 11 the
 > weather icon on the *left* opens the **Widgets board**, and placing a tile
@@ -108,37 +152,12 @@ Identical protocol to the web tool / the python `lywsd02` library:
 - Payload = **5 bytes**: `uint32` little-endian UTC Unix time + `int8` timezone (hours)
 
 The clock displays `UTC + timezone`. The timezone defaults to this PC's current
-offset (DST-aware) at run time.
-
-## Your clock
-
-- Address: **`E7:2E:01:92:C1:1F`**  (advertised name `LYWSD02`)
-- Timezone: auto-detected as **UTC+10**
-
-The scheduled task is already installed: **weekly on Wednesday at 12:00**,
-90-second scan, matching by that address (and by name as a fallback).
-
-## Toggle: turning automatic sync on/off
-
-Running the app **by hand** flips the scheduled task between **Enabled** and
-**Disabled** (after attempting the sync). So to pause automatic syncing, just
-run it once; run it again to switch automation back on:
-
-```powershell
-.\Sync-LYWSD02.ps1 -Address E7:2E:01:92:C1:1F      # syncs AND toggles the schedule
-```
-
-Each run logs the new state, e.g. `toggled: Enabled -> DISABLED`.
-
-- Runs launched by **Task Scheduler** pass `-FromScheduler` and **never** toggle,
-  so the weekly Wednesday sync can't disable itself.
-- To sync by hand **without** touching the schedule, add `-NoToggle`.
-- `-Survey` runs never toggle either.
+offset (DST-aware) at run time, or pass `-TimezoneOffset <hours>`.
 
 ## Reading temperature / humidity / battery
 
 ```powershell
-.\Sync-LYWSD02.ps1 -ReadSensors -Address E7:2E:01:92:C1:1F -ScanSeconds 60
+.\Sync-LYWSD02.ps1 -ReadSensors -Address AA:BB:CC:DD:EE:FF -ScanSeconds 60
 ```
 
 Example output:
@@ -146,73 +165,90 @@ Example output:
 ```
   Temperature : 23.3 C  (74.0 F)
   Humidity    : 44%
-  Battery     : 9%
+  Battery     : 87%
 ```
 
-How it works: temperature + humidity come from a BLE *notification* on
-characteristic `EBE0CCC1` (3 bytes = int16 temperature ×100 little-endian,
-then 1 byte humidity %); battery is a direct read of `EBE0CCC4`. Temperature is
-always reported in Celsius by the device (Fahrenheit is computed for
-convenience). `-ReadSensors` only reads — it never sets the time and never
-toggles the scheduled task. Because the clock advertises intermittently, give it
-a generous `-ScanSeconds` (and press the clock's button to wake it if needed).
+Temperature + humidity come from a BLE *notification* on characteristic
+`EBE0CCC1` (3 bytes = int16 temperature ×100 little-endian, then 1 byte
+humidity %); battery is a direct read of `EBE0CCC4`. Temperature is always
+reported in Celsius by the device (Fahrenheit is computed for convenience).
+`-ReadSensors` only reads — it never sets the time. Add `-Json` for a single
+machine-readable line (used internally by the widget).
+
+## Scheduling automatic sync
+
+```powershell
+# Weekly on Wednesday at 12:00
+.\Install-Schedule.ps1 -Interval Weekly -DaysOfWeek Wednesday -Time 12:00 -Address AA:BB:CC:DD:EE:FF -ScanSeconds 90
+
+# Daily at 06:30
+.\Install-Schedule.ps1 -Interval Daily -Time 06:30 -Address AA:BB:CC:DD:EE:FF -ScanSeconds 90
+
+# Multiple days
+.\Install-Schedule.ps1 -Interval Weekly -DaysOfWeek Monday,Thursday -Time 09:00 -Address AA:BB:CC:DD:EE:FF
+
+# Run the task now / remove it
+Start-ScheduledTask -TaskName 'LYWSD02 Clock Sync'
+.\Install-Schedule.ps1 -Uninstall
+```
+
+Re-running `Install-Schedule.ps1` overwrites the existing task in place, so it
+doubles as the way to change the time/day.
+
+### Toggling automatic sync on/off
+
+Running `Sync-LYWSD02.ps1` **by hand** flips the scheduled task between
+**Enabled** and **Disabled** after the sync, so you can pause/resume automation
+just by running it again:
+
+```powershell
+.\Sync-LYWSD02.ps1 -Address AA:BB:CC:DD:EE:FF      # syncs AND toggles the schedule
+```
+
+- Runs launched by **Task Scheduler** pass `-FromScheduler` and **never** toggle,
+  so a recurring sync can't disable itself.
+- To sync by hand **without** touching the schedule, add `-NoToggle`.
+- `-Survey` and `-ReadSensors` runs never toggle.
 
 ## Everyday use
 
 ```powershell
-# One-off manual sync (uses your installed address + name)
-.\Sync-LYWSD02.ps1 -Address E7:2E:01:92:C1:1F
+# One-off manual sync
+.\Sync-LYWSD02.ps1 -Address AA:BB:CC:DD:EE:FF
 
 # Read temperature, humidity and battery (no time change)
-.\Sync-LYWSD02.ps1 -ReadSensors -Address E7:2E:01:92:C1:1F -ScanSeconds 60
+.\Sync-LYWSD02.ps1 -ReadSensors -Address AA:BB:CC:DD:EE:FF -ScanSeconds 60
 
-# Just scan and list everything nearby (find the address again if needed)
+# List every BLE advertiser nearby (find / re-find the clock's address)
 .\Sync-LYWSD02.ps1 -Survey
 
 # Force a specific timezone instead of auto-detect
-.\Sync-LYWSD02.ps1 -Address E7:2E:01:92:C1:1F -TimezoneOffset 10
-
-# Run the scheduled task right now
-Start-ScheduledTask -TaskName 'LYWSD02 Clock Sync'
+.\Sync-LYWSD02.ps1 -Address AA:BB:CC:DD:EE:FF -TimezoneOffset 10
 
 # See recent results
 Get-Content .\logs\sync.log -Tail 20
 ```
 
-## Changing the scheduled time
-
-Re-run `Install-Schedule.ps1` with the new time/day — it overwrites the existing
-task in place:
-
-```powershell
-# Current setting: weekly on Wednesday at 12:00
-.\Install-Schedule.ps1 -Interval Weekly -DaysOfWeek Wednesday -Time 12:00 -Address E7:2E:01:92:C1:1F -ScanSeconds 90
-
-# Change to weekly on Sunday at 09:00
-.\Install-Schedule.ps1 -Interval Weekly -DaysOfWeek Sunday -Time 09:00 -Address E7:2E:01:92:C1:1F -ScanSeconds 90
-
-# Or daily at 06:30
-.\Install-Schedule.ps1 -Interval Daily -Time 06:30 -Address E7:2E:01:92:C1:1F -ScanSeconds 90
-
-# Remove it entirely
-.\Install-Schedule.ps1 -Uninstall
-```
-
-`-DaysOfWeek` accepts multiple days, e.g. `-DaysOfWeek Monday,Thursday`.
-
 ## Notes & troubleshooting
 
-- **The clock must be powered and within a few metres of the PC.** It advertises
-  only intermittently, so the script scans (up to `-ScanSeconds`) until it sees
-  the clock, then connects and writes immediately. A miss on one day is harmless
-  — the clock drifts only ~1 min/month, and the task retries up to 3×.
+- **The clock advertises only intermittently**, so the scripts scan (up to
+  `-ScanSeconds`) until they see it, then connect and write immediately. A miss
+  on one run is harmless — the clock drifts only ~1 min/month, and the scheduled
+  task retries up to 3×.
 - **The PC must be on and awake** at the scheduled time (it runs in your user
   session — BLE needs an interactive context). Pick a time your PC is normally on.
 - **If syncing suddenly fails after a battery change**, the clock's Bluetooth
-  address may have changed. Run `.\Sync-LYWSD02.ps1 -Survey`, note the new
-  address next to name `LYWSD02`, and re-run `Install-Schedule.ps1` with it.
-- **Exit codes:** `0` success · `1` unexpected error · `3` clock not seen ·
-  `7` connected but write failed. All runs are logged to `logs\sync.log`.
-- Requires Windows 10/11 with a Bluetooth LE radio and the Windows SDK union
-  metadata present (it was on this machine at
-  `Windows Kits\10\UnionMetadata\10.0.19041.0`).
+  address may have changed (it uses a static-random address that can change on
+  power loss). Run `.\Sync-LYWSD02.ps1 -Survey`, note the new address next to
+  name `LYWSD02`, and re-run `Install-Widget.ps1` / `Install-Schedule.ps1` with
+  it. The widget also re-learns the address automatically when it sees the clock
+  by name.
+- **Exit codes** (`Sync-LYWSD02.ps1`): `0` success · `1` unexpected error ·
+  `2` WinRT load failed · `3` clock not seen · `7` connected but write failed.
+  All runs are logged to `logs\sync.log`; the widget logs to `logs\widget.log`.
+- **PowerShell execution policy:** the install scripts and scheduled task launch
+  with `-ExecutionPolicy Bypass`, so you don't need to change your machine policy.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
