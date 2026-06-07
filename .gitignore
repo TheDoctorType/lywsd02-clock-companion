@@ -1,0 +1,12 @@
+# User-specific runtime data (generated at install / run time)
+settings.json
+logs/
+
+# Scratch / temp artifacts
+_*.ps1
+_*.png
+*.tmp
+
+# OS
+Thumbs.db
+desktop.ini
