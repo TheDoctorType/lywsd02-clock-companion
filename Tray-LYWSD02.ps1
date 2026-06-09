@@ -253,12 +253,14 @@ function New-TrendChart {
     $area.AxisX.LabelStyle.ForeColor = $fg; $area.AxisX.LineColor = $grid; $area.AxisX.MajorGrid.LineColor = $grid
     $area.AxisX.LabelStyle.Format = if ($Compact) {'HH:mm'} else {'ddd HH:mm'}
     $area.AxisX.IntervalType = [System.Windows.Forms.DataVisualization.Charting.DateTimeIntervalType]::Hours
-    # Left axis = Temperature + Dew point (deg C), colour-coded orange, auto-scaled.
+    # Left axis = Temperature + Dew point (deg C), colour-coded orange. Auto-fit to
+    # the data range (don't force 0) so the variation is visible.
     $area.AxisY.LabelStyle.ForeColor = $cTemp; $area.AxisY.LineColor = $cTemp; $area.AxisY.MajorGrid.LineColor = $grid
-    # Right axis = Humidity, colour-coded green, FIXED 0-100 so it can never
-    # coincidentally overlap the temperature line.
+    $area.AxisY.IsStartedFromZero = $false
+    # Right axis = Humidity, colour-coded green. Also auto-fit. (Colour-coded axes
+    # + point markers keep it distinct from the temperature line.)
     $area.AxisY2.Enabled = [System.Windows.Forms.DataVisualization.Charting.AxisEnabled]::True
-    $area.AxisY2.Minimum = 0; $area.AxisY2.Maximum = 100; $area.AxisY2.Interval = 20
+    $area.AxisY2.IsStartedFromZero = $false
     $area.AxisY2.LabelStyle.ForeColor = $cHum; $area.AxisY2.LineColor = $cHum; $area.AxisY2.MajorGrid.Enabled = $false
     if (-not $Compact) {
         $area.AxisY.Title  = "Temperature / Dew point  ($($deg)C)"; $area.AxisY.TitleForeColor = $cTemp

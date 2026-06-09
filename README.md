@@ -129,18 +129,19 @@ chart only appears once it has data):
 - **Temperature** (orange) — **left** axis, °C
 - **Dew point** (dashed blue) — **left** axis, °C (computed from temp + humidity
   via the Magnus formula, `a=17.62, b=243.12`)
-- **Humidity** (green) — **right** axis, fixed **0–100 %**
+- **Humidity** (green) — **right** axis, %
 
 **Bottom — Aranet4 (air quality).**
 
 - **CO₂** (gold) — **left** axis, ppm
 - **Pressure** (purple) — **right** axis, hPa
 
-The humidity axis is pinned to 0–100 % (rather than auto-scaled) so the green
-line can never coincidentally land on top of the temperature line, and every
-reading is drawn as a point marker — so the series stay readable even when values
-are nearly flat. Dew point is the temperature at which the air would become
-saturated — when the room temperature nears the dew-point line, it feels muggy.
+Every axis **auto-fits its data range** (rather than starting at zero) so the real
+variation is visible — CO₂ never gets near 0, pressure and humidity move only a
+little, and forcing zero would squash them flat. Each series is colour-matched to
+its axis and drawn with point markers, so the lines stay distinct where they
+cross. Dew point is the temperature at which the air would become saturated —
+when the room temperature nears the dew-point line, it feels muggy.
 
 Each chart reads straight from its CSV and fills out as history grows:
 
