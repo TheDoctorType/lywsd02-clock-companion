@@ -335,7 +335,11 @@ function New-Co2Chart {
     $area.AxisX.LabelStyle.Format = if ($Compact) {'HH:mm'} else {'ddd HH:mm'}
     $area.AxisX.IntervalType = [System.Windows.Forms.DataVisualization.Charting.DateTimeIntervalType]::Hours
     $area.AxisY.LabelStyle.ForeColor = $cCo2; $area.AxisY.LineColor = $cCo2; $area.AxisY.MajorGrid.LineColor = $grid
+    # Auto-fit to the data range instead of forcing 0 (CO2 never gets near 0, and
+    # pressure barely moves) so both series spread out vertically.
+    $area.AxisY.IsStartedFromZero = $false
     $area.AxisY2.Enabled = [System.Windows.Forms.DataVisualization.Charting.AxisEnabled]::True
+    $area.AxisY2.IsStartedFromZero = $false
     $area.AxisY2.LabelStyle.ForeColor = $cPres; $area.AxisY2.LineColor = $cPres; $area.AxisY2.MajorGrid.Enabled = $false
     if (-not $Compact) {
         $area.AxisY.Title  = 'CO2 (ppm)'; $area.AxisY.TitleForeColor = $cCo2
