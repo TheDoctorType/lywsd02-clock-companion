@@ -27,6 +27,7 @@
 param(
     [string]$Address,
     [int]$IntervalMinutes = 60,
+    [int]$AranetIntervalMinutes = 5,
     [int]$ScanSeconds = 90,
     [switch]$NoStartup,
     [switch]$Uninstall
@@ -42,7 +43,7 @@ function Stop-Widget {
     # Require '-File' (real launches use it) and exclude our own PID so a caller whose
     # command line merely mentions the script name can't be killed by accident.
     Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like '*-File*Tray-LYWSD02.ps1*' -and $_.ProcessId -ne $PID } |
+        Where-Object { ($_.CommandLine -like '*-File*Tray-LYWSD02.ps1*' -or $_.CommandLine -like '*-File*Watch-Aranet4.ps1*') -and $_.ProcessId -ne $PID } |
         ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
 }
 
@@ -61,6 +62,9 @@ $settings = [ordered]@{
     IntervalMinutes   = $IntervalMinutes
     ConnectionEnabled = $true
     HourlyLogging     = $true
+    AranetEnabled     = $true
+    AranetIntervalMinutes = $AranetIntervalMinutes
+    AranetScanSeconds = 150
     TrendRange        = '7d'
     TrendFrom         = ''
     TrendTo           = ''
@@ -71,6 +75,10 @@ if (Test-Path $settingsPath) {
         if (-not $Address -and $old.Address) { $settings.Address = $old.Address }
         if ($null -ne $old.ConnectionEnabled) { $settings.ConnectionEnabled = [bool]$old.ConnectionEnabled }
         if ($null -ne $old.HourlyLogging)     { $settings.HourlyLogging = [bool]$old.HourlyLogging }
+        if ($null -ne $old.AranetEnabled)     { $settings.AranetEnabled = [bool]$old.AranetEnabled }
+        if ($old.AranetScanSeconds)           { $settings.AranetScanSeconds = [int]$old.AranetScanSeconds }
+        # Preserve a saved interval unless the caller explicitly overrode it.
+        if ($old.AranetIntervalMinutes -and -not $PSBoundParameters.ContainsKey('AranetIntervalMinutes')) { $settings.AranetIntervalMinutes = [int]$old.AranetIntervalMinutes }
         if ($old.TrendRange) { $settings.TrendRange = $old.TrendRange }
         if ($old.TrendFrom)  { $settings.TrendFrom  = $old.TrendFrom }
         if ($old.TrendTo)    { $settings.TrendTo    = $old.TrendTo }

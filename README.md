@@ -1,13 +1,17 @@
 # LYWSD02 Clock Companion (Windows)
 
-Zero-install Windows tools for the **Xiaomi LYWSD02 ("Mijia") Bluetooth clock**:
+Zero-install Windows tools for the **Xiaomi LYWSD02 ("Mijia") Bluetooth clock**,
+with optional **Aranet4 air-quality (CO₂)** monitoring:
 
 - **Set the clock's time** over Bluetooth LE (a local, scriptable equivalent of
   the web tool at <https://saso5.github.io/LYWSD02-clock-sync/>), runnable
   unattended from **Task Scheduler**.
 - **A system-tray widget** that shows the current temperature in the taskbar,
-  logs temperature/humidity/battery hourly to CSV, and graphs temperature,
-  humidity and dew point.
+  logs temperature/humidity/battery to CSV, and graphs temperature, humidity and
+  dew point.
+- **Optional Aranet4 support** — if you have an Aranet4 CO₂ monitor nearby, the
+  widget also captures **CO₂ / temperature / humidity / pressure** (passively,
+  no pairing) and graphs it as a second device alongside the clock.
 
 Everything is plain PowerShell that drives Bluetooth LE through the built-in
 Windows Runtime (WinRT) APIs via a tiny C# helper compiled on the fly.
@@ -56,12 +60,15 @@ current local offset (DST-aware) at run time, or pass `-TimezoneOffset <hours>`.
 |------|---------|
 | `Sync-LYWSD02.ps1`   | The core app. Scans for the clock and writes the time / reads sensors. |
 | `Install-Schedule.ps1` | Creates/removes the scheduled time-sync task. |
-| `Tray-LYWSD02.ps1`   | System-tray widget (temperature in the taskbar, hourly logging, toggles). |
+| `Tray-LYWSD02.ps1`   | System-tray widget (taskbar temperature, logging, graphs, toggles). |
 | `Install-Widget.ps1` | Installs/removes the tray widget + login startup. |
 | `Start-Widget.vbs`   | Launches the widget with no console window. |
-| `settings.json`      | Widget settings (address, interval, toggles) — generated locally, git-ignored. |
-| `logs\sensors.csv`   | Hourly temperature/humidity/battery history — generated locally, git-ignored. |
-| `logs\sync.log`, `logs\widget.log` | Run logs — generated locally, git-ignored. |
+| `Read-Aranet4.ps1`   | Standalone CLI: read CO₂/temp/humidity/pressure from a nearby Aranet4. |
+| `Watch-Aranet4.ps1`  | Persistent Aranet4 listener used by the widget (writes latest reading to JSON). |
+| `settings.json`      | Widget settings — generated locally, git-ignored. |
+| `logs\sensors.csv`   | LYWSD02 temperature/humidity/battery history — generated locally, git-ignored. |
+| `logs\aranet4.csv`   | Aranet4 CO₂/temp/humidity/pressure history — generated locally, git-ignored. |
+| `logs\*.log`, `logs\aranet-latest.json` | Run logs / latest Aranet reading — generated locally, git-ignored. |
 
 ## Taskbar widget
 
@@ -78,12 +85,15 @@ to keep it visible). **Right-click** the icon for the menu:
 
 | Menu item | What it does |
 |-----------|--------------|
-| **Read now** | Read temperature/humidity/battery immediately (also logs to CSV). |
+| **Read clock now** | Read the LYWSD02 temperature/humidity/battery immediately (also logs). |
+| **Read Aranet4 now** | Sample the latest captured CO₂ reading immediately (also logs). |
 | **Sync clock now** | Set the clock's time over Bluetooth. |
-| **Show trends...** | Open the graph in a resizable window. |
-| **Connection enabled / disabled** | Toggle BLE on/off. Disabled = battery saver: no hourly polling, icon greys out. |
-| **Log hourly to CSV** | Turn the hourly `sensors.csv` logging on/off. |
-| **Open data folder** | Open the `logs` folder (CSV + logs). |
+| **Show trends...** | Open the graphs in a resizable window. |
+| **Connection enabled / disabled** | Toggle all BLE on/off. Disabled = battery saver: icon greys out. |
+| **Log hourly to CSV** | Turn CSV logging on/off (both devices). |
+| **Track Aranet4 (CO2)** | Enable/disable the Aranet4 listener. |
+| **Aranet4 read interval ▸** | How often to log CO₂ (1 / 2 / 3 / 5 / 10 / 15 / 30 min). |
+| **Open data folder** | Open the `logs` folder (CSVs + logs). |
 | **Run at login** | Toggle the Startup shortcut. |
 | **Exit** | Close the widget. |
 
@@ -105,35 +115,43 @@ As history grows the graph can get busy, so the range filter keeps it readable
 the visible span).
 
 Configure with `Install-Widget.ps1` parameters: `-Address`, `-IntervalMinutes`
-(default 60), `-ScanSeconds` (default 90), `-NoStartup`. Remove with
-`.\Install-Widget.ps1 -Uninstall` (keeps your CSV and settings).
+(clock, default 60), `-AranetIntervalMinutes` (CO₂, default 5), `-ScanSeconds`
+(default 90), `-NoStartup`. Remove with `.\Install-Widget.ps1 -Uninstall`
+(keeps your CSVs and settings).
 
 ### The trends graph
 
-One chart shows all three series together, with each axis colour-matched to its
-line so it's clear which scale belongs to which colour:
+The window shows the two devices as **separate stacked charts** (the Aranet4
+chart only appears once it has data):
+
+**Top — LYWSD02 (clock).** One chart, axes colour-matched to the lines:
 
 - **Temperature** (orange) — **left** axis, °C
 - **Dew point** (dashed blue) — **left** axis, °C (computed from temp + humidity
   via the Magnus formula, `a=17.62, b=243.12`)
 - **Humidity** (green) — **right** axis, fixed **0–100 %**
 
+**Bottom — Aranet4 (air quality).**
+
+- **CO₂** (gold) — **left** axis, ppm
+- **Pressure** (purple) — **right** axis, hPa
+
 The humidity axis is pinned to 0–100 % (rather than auto-scaled) so the green
 line can never coincidentally land on top of the temperature line, and every
-reading is drawn as a point marker — so the three series stay readable even when
-values are nearly flat.
+reading is drawn as a point marker — so the series stay readable even when values
+are nearly flat. Dew point is the temperature at which the air would become
+saturated — when the room temperature nears the dew-point line, it feels muggy.
 
-Dew point is the temperature at which the air would become saturated — when the
-room temperature gets close to the dew-point line, it feels muggy / condensation
-is likely. The graph reads straight from `sensors.csv`, so it fills out as the
-hourly history grows.
-
-Each hour (configurable via `-IntervalMinutes`) the widget reads and appends a
-row to `logs\sensors.csv`:
+Each chart reads straight from its CSV and fills out as history grows:
 
 ```
+# logs\sensors.csv  (LYWSD02, every -IntervalMinutes, default 60)
 timestamp,tempC,tempF,humidity,battery
 2026-01-31 18:50:15,22.96,73.3,46,87
+
+# logs\aranet4.csv  (Aranet4, every AranetIntervalMinutes, default 5)
+timestamp,co2,tempC,humidity,pressure,battery,status
+2026-01-31 18:50:15,684,22.8,53,1030.8,36,green
 ```
 
 > **Why the system tray and not next to the weather icon?** In Windows 11 the
@@ -174,6 +192,49 @@ humidity %); battery is a direct read of `EBE0CCC4`. Temperature is always
 reported in Celsius by the device (Fahrenheit is computed for convenience).
 `-ReadSensors` only reads — it never sets the time. Add `-Json` for a single
 machine-readable line (used internally by the widget).
+
+## Air quality (Aranet4, optional)
+
+If you have an **Aranet4** CO₂ monitor nearby, the widget can capture its
+readings too — **passively, with no pairing and no connection**.
+
+**Enable broadcasting first:** in the **Aranet Home app**, turn on
+**Smart Home Integration** for the device. It then advertises its measurements in
+the BLE advertisement (manufacturer id `0x0702`).
+
+Read it from the command line:
+
+```powershell
+.\Read-Aranet4.ps1            # or -Json for a machine-readable line
+```
+
+```
+  CO2         : 684 ppm  (green)
+  Temperature : 22.8 C
+  Humidity    : 53%
+  Pressure    : 1030.8 hPa
+  Battery     : 36%
+```
+
+**How the widget captures it.** The Aranet broadcasts its measurement packet only
+in bursts (≈ once a minute, with occasional multi-minute gaps), so a single short
+scan often misses it. Instead the widget runs a **persistent background listener**
+(`Watch-Aranet4.ps1`) that stays on and writes the latest reading to
+`logs\aranet-latest.json` whenever a packet arrives. The widget then **samples**
+that file every *Aranet4 read interval* minutes (instant, no radio) and appends a
+row to `logs\aranet4.csv`. The listener is paused only during the rare clock scan
+so the two never compete for the radio.
+
+- The device is matched by **company id `0x0702`**, not a fixed address (its
+  address rotates for privacy).
+- The read interval is independent of the clock's, selectable from the tray menu
+  (**Aranet4 read interval**) or `Install-Widget.ps1 -AranetIntervalMinutes <n>`.
+- Turn capture off entirely with **Track Aranet4 (CO2)** in the menu.
+
+**Decode** (advertisement manufacturer data `0x0702`): an 8-byte header (bit
+`0x20` of byte 0 set = measurements present), then at offset 8 —
+`CO₂` u16 ppm · `temp` u16 ÷20 °C · `pressure` u16 ÷10 hPa · `humidity` u8 % ·
+`battery` u8 % · `status` u8 (1 green / 2 amber / 3 red).
 
 ## Scheduling automatic sync
 
@@ -243,6 +304,10 @@ Get-Content .\logs\sync.log -Tail 20
   name `LYWSD02`, and re-run `Install-Widget.ps1` / `Install-Schedule.ps1` with
   it. The widget also re-learns the address automatically when it sees the clock
   by name.
+- **No Aranet4 readings?** Make sure **Smart Home Integration** is enabled in the
+  Aranet app (without it the device doesn't broadcast measurements). Its broadcast
+  is bursty, so the first capture after launch can take a few minutes; the
+  persistent listener catches up as soon as a packet arrives.
 - **Exit codes** (`Sync-LYWSD02.ps1`): `0` success · `1` unexpected error ·
   `2` WinRT load failed · `3` clock not seen · `7` connected but write failed.
   All runs are logged to `logs\sync.log`; the widget logs to `logs\widget.log`.
