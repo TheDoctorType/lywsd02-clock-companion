@@ -787,6 +787,69 @@ $script:hide.Add_Tick({
     } catch {}
 })
 
+# ---- Scroll-wheel zoom on the trends window -------------------------------
+# Returns the X data range (OADate doubles) and largest point count of a chart.
+function Get-ChartXRange($chart) {
+    $mn = [double]::PositiveInfinity; $mx = [double]::NegativeInfinity; $pc = 0
+    foreach ($s in $chart.Series) {
+        $n = $s.Points.Count
+        if ($n -gt 0) {
+            if ($s.Points[0].XValue   -lt $mn) { $mn = $s.Points[0].XValue }
+            if ($s.Points[$n-1].XValue -gt $mx) { $mx = $s.Points[$n-1].XValue }
+            if ($n -gt $pc) { $pc = $n }
+        }
+    }
+    return @{ Min=$mn; Max=$mx; Count=$pc }
+}
+function Zoom-Reset {
+    foreach ($c in @($script:trendChart, $script:trendCo2Chart)) {
+        if ($c) { try { $c.ChartAreas['main'].AxisX.ScaleView.ZoomReset(0) } catch {} }
+    }
+}
+# Apply the same absolute time window [vmin,vmax] (OADate) to both charts, each
+# clamped to its own data range, so the two devices stay time-aligned.
+function Zoom-Apply($vmin, $vmax) {
+    foreach ($c in @($script:trendChart, $script:trendCo2Chart)) {
+        if (-not $c) { continue }
+        try {
+            $r = Get-ChartXRange $c
+            if ($r.Count -lt 2 -or $r.Max -le $r.Min) { continue }
+            $mn = [math]::Max($vmin, $r.Min); $mx = [math]::Min($vmax, $r.Max)
+            if ($mx -gt $mn) { $c.ChartAreas['main'].AxisX.ScaleView.Zoom($mn, $mx) }
+            else { $c.ChartAreas['main'].AxisX.ScaleView.ZoomReset(0) }
+        } catch {}
+    }
+}
+$script:OnChartWheel = {
+    param($sender, $e)
+    try {
+        $chart = $sender
+        $ax = $chart.ChartAreas['main'].AxisX
+        $r = Get-ChartXRange $chart
+        if ($r.Count -lt 2 -or $r.Max -le $r.Min) { return }
+        $fullRange = $r.Max - $r.Min
+        $sv = $ax.ScaleView
+        if ($sv.IsZoomed) { $curMin = $sv.ViewMinimum; $curMax = $sv.ViewMaximum } else { $curMin = $r.Min; $curMax = $r.Max }
+        if ([double]::IsNaN($curMin) -or [double]::IsNaN($curMax) -or $curMax -le $curMin) { $curMin = $r.Min; $curMax = $r.Max }
+        $curRange = $curMax - $curMin
+        # Anchor the zoom on the time value under the cursor.
+        $anchor = $null
+        try { $anchor = $ax.PixelPositionToValue([double]$e.Location.X) } catch {}
+        if ($null -eq $anchor -or [double]::IsNaN($anchor) -or $anchor -lt $curMin -or $anchor -gt $curMax) { $anchor = ($curMin + $curMax) / 2 }
+        $minRange = 3.0 * $fullRange / $r.Count            # ~3 samples = max zoom-in
+        $factor = if ($e.Delta -gt 0) { 0.8 } else { 1.25 } # wheel up = zoom in
+        $newRange = $curRange * $factor
+        if ($newRange -ge $fullRange) { Zoom-Reset; return } # zoomed all the way out
+        if ($newRange -lt $minRange) { $newRange = $minRange }
+        $leftFrac = ($anchor - $curMin) / $curRange
+        $newMin = $anchor - $leftFrac * $newRange
+        $newMax = $newMin + $newRange
+        if ($newMin -lt $r.Min) { $newMin = $r.Min; $newMax = $r.Min + $newRange }
+        if ($newMax -gt $r.Max) { $newMax = $r.Max; $newMin = $r.Max - $newRange }
+        Zoom-Apply $newMin $newMax
+    } catch {}
+}
+
 function Show-TrendsWindow {
     try {
         if ($script:trendForm -and -not $script:trendForm.IsDisposed) {
@@ -796,7 +859,7 @@ function Show-TrendsWindow {
             $script:trendForm.Activate(); return
         }
         $f = New-Object System.Windows.Forms.Form
-        $f.Text = 'Environment trends  -  LYWSD02 clock + Aranet4'
+        $f.Text = 'Environment trends  -  LYWSD02 + Aranet4   (scroll to zoom, scrollbar to pan)'
         $f.Size = New-Object System.Drawing.Size(920,640)
         $f.MinimumSize = New-Object System.Drawing.Size(580,420)
         $f.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
@@ -805,6 +868,11 @@ function Show-TrendsWindow {
         # Two devices, two stacked charts: LYWSD02 (top) and Aranet4 (bottom).
         $envChart = New-TrendChart $false; $envChart.Dock = [System.Windows.Forms.DockStyle]::Fill
         $co2Chart = New-Co2Chart  $false; $co2Chart.Dock = [System.Windows.Forms.DockStyle]::Fill
+        # Mouse-wheel zoom (time axis). Focus the chart on hover so it gets the wheel.
+        foreach ($c in @($envChart, $co2Chart)) {
+            $c.Add_MouseEnter({ try { $this.Focus() } catch {} })
+            $c.Add_MouseWheel($script:OnChartWheel)
+        }
         $split = New-Object System.Windows.Forms.SplitContainer
         $split.Dock = [System.Windows.Forms.DockStyle]::Fill
         $split.Orientation = [System.Windows.Forms.Orientation]::Horizontal
@@ -861,6 +929,7 @@ function Show-TrendsWindow {
                 }
                 Save-Settings
                 Rebuild-Both
+                Zoom-Reset   # new time scope -> start unzoomed
             } catch { WLog "WARN range change: $($_.Exception.Message)" }
         }
         $script:cbRange.Add_SelectedIndexChanged($applyRange)

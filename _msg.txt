@@ -1,0 +1,10 @@
+Add mouse-wheel zoom to the trends window
+
+Scroll the wheel over a chart to zoom the time axis in/out, centred on the cursor
+(AxisX.ScaleView), from the full dataset down to a ~3-sample window. Both stacked
+charts zoom together so the clock and Aranet stay time-aligned, each clamped to
+its own data range; a scrollbar appears for panning when zoomed, and scrolling
+fully out resets to the full view. Charts take focus on hover so they receive the
+wheel. Changing the Range filter resets the zoom.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>

@@ -106,10 +106,14 @@ in the header. **Clicking the popup**, **double-clicking the icon**, or
 In the **window**:
 
 - **Hover over any data point** to float that point's exact reading and time.
+- **Scroll the mouse wheel** over a chart to zoom the time axis in/out, centred on
+  the cursor — from the whole dataset down to a ~3-sample window. Both charts zoom
+  together so the clock and air-quality stay time-aligned; when zoomed, a
+  scrollbar appears to pan. Scrolling all the way out resets to the full view.
 - A **Range** dropdown filters the time frame: *Last hour / 6 hours / 24 hours /
   7 days / 30 days / All*, or **Custom range…** (which reveals two date pickers).
   The choice is remembered between sessions and **defaults to the last 7 days**.
-- **Refresh** re-reads the CSV; **Open CSV** opens the data file.
+- **Refresh** re-reads the CSVs; **Open data** opens the `logs` folder.
 
 As history grows the graph can get busy, so the range filter keeps it readable
 (and the X-axis labels switch between time-of-day and date automatically based on
