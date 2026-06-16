@@ -91,6 +91,7 @@ to keep it visible). **Right-click** the icon for the menu:
 | **Show trends...** | Open the graphs in a resizable window. |
 | **Connection enabled / disabled** | Toggle all BLE on/off. Disabled = battery saver: icon greys out. |
 | **Log hourly to CSV** | Turn CSV logging on/off (both devices). |
+| **LYWSD02 read interval ▸** | How often to read the clock (5 / 10 / 15 / 30 / 60 min). |
 | **Track Aranet4 (CO2)** | Enable/disable the Aranet4 listener. |
 | **Aranet4 read interval ▸** | How often to log CO₂ (1 / 2 / 3 / 5 / 10 / 15 / 30 min). |
 | **Open data folder** | Open the `logs` folder (CSVs + logs). |

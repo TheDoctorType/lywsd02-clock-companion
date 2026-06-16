@@ -412,6 +412,7 @@ $miSync       = New-Item 'Sync clock now'
 $miTrends     = New-Item 'Show trends...'
 $miConn       = New-Item 'Connection enabled'
 $miLog        = New-Item 'Log hourly to CSV'
+$miClockIvl   = New-Item 'LYWSD02 read interval'
 $miAranet     = New-Item 'Track Aranet4 (CO2)'
 $miAranetIvl  = New-Item 'Aranet4 read interval'
 $miOpen       = New-Item 'Open data folder'
@@ -436,12 +437,31 @@ foreach ($mins in $script:AranetIvlOptions) {
     $script:miAranetIvlItems[$mins] = $item
 }
 
+# Sub-menu of selectable LYWSD02 read intervals (minutes). The clock connects
+# over BLE for each read, which uses its coin-cell battery, so the options are
+# more conservative than the (passive) Aranet's.
+$script:ClockIvlOptions = @(5,10,15,30,60)
+$script:miClockIvlItems = @{}
+foreach ($mins in $script:ClockIvlOptions) {
+    $item = New-Object System.Windows.Forms.ToolStripMenuItem("Every $mins minutes")
+    $item.Tag = $mins
+    $item.Add_Click({
+        param($s,$e)
+        $script:settings.IntervalMinutes = [int]$s.Tag
+        $script:clockDue = Get-Date              # apply immediately
+        Save-Settings; Refresh-Menu
+        Scheduler-Tick
+    })
+    [void]$miClockIvl.DropDownItems.Add($item)
+    $script:miClockIvlItems[$mins] = $item
+}
+
 $menu.Items.AddRange(@(
     $miTitle, $miReading,
     (New-Object System.Windows.Forms.ToolStripSeparator),
     $miRead, $miReadAranet, $miSync, $miTrends,
     (New-Object System.Windows.Forms.ToolStripSeparator),
-    $miConn, $miLog, $miAranet, $miAranetIvl, $miOpen, $miStartup,
+    $miConn, $miLog, $miClockIvl, $miAranet, $miAranetIvl, $miOpen, $miStartup,
     (New-Object System.Windows.Forms.ToolStripSeparator),
     $miExit
 ))
@@ -485,6 +505,9 @@ function Refresh-Menu {
     $miAranetIvl.Enabled = [bool]$script:settings.AranetEnabled
     $miAranetIvl.Text = "Aranet4 read interval ($ivl min)"
     foreach ($k in $script:miAranetIvlItems.Keys) { $script:miAranetIvlItems[$k].Checked = ($k -eq $ivl) }
+    $civl = [int]$script:settings.IntervalMinutes; if ($civl -lt 1) { $civl = 60 }
+    $miClockIvl.Text = "LYWSD02 read interval ($civl min)"
+    foreach ($k in $script:miClockIvlItems.Keys) { $script:miClockIvlItems[$k].Checked = ($k -eq $civl) }
 }
 
 # ---- Tooltip --------------------------------------------------------------
