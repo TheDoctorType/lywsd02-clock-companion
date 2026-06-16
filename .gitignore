@@ -2,9 +2,8 @@
 settings.json
 logs/
 
-# Scratch / temp artifacts
-_*.ps1
-_*.png
+# Scratch / temp artifacts (anything prefixed with _)
+_*
 *.tmp
 
 # OS
