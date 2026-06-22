@@ -962,9 +962,34 @@ function Fill-Round($g, $brush, $rect, $r) {
     $g.FillPath($brush, $gp)
     $gp.Dispose()
 }
+# Custom double-buffered controls. Plain WinForms panels don't double-buffer and
+# don't redraw on resize, so our owner-drawn cards smear/ghost when the window is
+# resized (each layout pass paints over the last). These types fix that.
+function Ensure-DashTypes {
+    if ('Vulcan.CardPanel' -as [type]) { return }
+    Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @"
+using System.Windows.Forms;
+namespace Vulcan {
+  public class CardPanel : Panel {
+    public CardPanel() {
+      this.DoubleBuffered = true;
+      this.SetStyle(ControlStyles.ResizeRedraw, true);
+    }
+  }
+  public class BufferedTable : TableLayoutPanel {
+    public BufferedTable() {
+      this.DoubleBuffered = true;
+      this.SetStyle(ControlStyles.ResizeRedraw, true);
+    }
+  }
+}
+"@
+}
+function New-CardPanel { Ensure-DashTypes; return New-Object Vulcan.CardPanel }
+function New-BufferedTable { Ensure-DashTypes; return New-Object Vulcan.BufferedTable }
 # A rounded card: a panel that paints a rounded filled rect (anti-aliased).
 function New-Card([int]$w, [int]$h, $color) {
-    $p = New-Object System.Windows.Forms.Panel
+    $p = New-CardPanel
     $p.Size = New-Object System.Drawing.Size($w, $h)
     $p.BackColor = $script:DashTheme.Bg
     $p.Tag = @{ Color = $color; Radius = 14 }
@@ -1011,6 +1036,7 @@ function Draw-GaugeCard($p, $g) {
     $T = $script:DashTheme; $d = $p.Tag
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
     $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
+    $g.Clear($p.BackColor)
     $w = [int]$p.Width; $h = [int]$p.Height
     $bg = New-Object System.Drawing.SolidBrush $T.Card
     Fill-Round $g $bg (New-Object System.Drawing.Rectangle(0, 0, ($w - 1), ($h - 1))) 16
@@ -1054,6 +1080,7 @@ function Draw-BatteryCard($p, $g) {
     $T = $script:DashTheme; $d = $p.Tag
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
     $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
+    $g.Clear($p.BackColor)
     $w = [int]$p.Width; $h = [int]$p.Height
     $bg = New-Object System.Drawing.SolidBrush $T.Card
     Fill-Round $g $bg (New-Object System.Drawing.Rectangle(0, 0, ($w - 1), ($h - 1))) 16; $bg.Dispose()
@@ -1095,7 +1122,7 @@ function Draw-BatteryCard($p, $g) {
 # A gauge panel. min/max define the arc range; accent is the default arc colour.
 function New-Gauge($key, $label, $min, $max, $unit, $accent, [bool]$big) {
     $w = if ($big) {360} else {174}; $h = if ($big) {236} else {150}
-    $p = New-Object System.Windows.Forms.Panel
+    $p = New-CardPanel
     $p.Size = New-Object System.Drawing.Size($w, $h)
     $p.BackColor = $script:DashTheme.Bg
     $p.Tag = @{ Key=$key; Label=$label; Min=$min; Max=$max; Unit=$unit; Accent=$accent; Big=$big; Value=$null; Disp='--'; ValColor=$accent; Sub=''; SubColor=$null }
@@ -1110,7 +1137,7 @@ function Set-Gauge($key, $value, $disp, $color, $sub, $subColor) {
 }
 # Battery card showing both devices' levels as separate bars.
 function New-BatteryCard($key) {
-    $p = New-Object System.Windows.Forms.Panel
+    $p = New-CardPanel
     $p.Size = New-Object System.Drawing.Size(174, 150)
     $p.BackColor = $script:DashTheme.Bg
     $p.Tag = @{ Clock=$null; Aranet=$null }
@@ -1136,7 +1163,7 @@ function New-DashButton($text, $accent) {
     return $b
 }
 function New-DashSwitch([int]$x, [int]$y) {
-    $t = New-Object System.Windows.Forms.Panel
+    $t = New-CardPanel
     $t.Size = New-Object System.Drawing.Size(46, 24); $t.Location = New-Object System.Drawing.Point($x, $y)
     $t.BackColor = $script:DashTheme.Bg; $t.Cursor = [System.Windows.Forms.Cursors]::Hand
     return $t
@@ -1306,7 +1333,7 @@ function Show-Dashboard {
         # Gauge column as a responsive grid so cards reflow/resize with the window
         # instead of clipping. Draw-GaugeCard derives all geometry from the live
         # panel size, so a Dock=Fill cell is all each card needs.
-        $gp = New-Object System.Windows.Forms.TableLayoutPanel
+        $gp = New-BufferedTable
         $gp.Dock = [System.Windows.Forms.DockStyle]::Fill; $gp.BackColor = $T.Bg
         $gp.Padding = New-Object System.Windows.Forms.Padding(16, 6, 6, 6)
         $gp.ColumnCount = 2; $gp.RowCount = 3
