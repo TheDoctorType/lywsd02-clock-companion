@@ -409,7 +409,7 @@ $miReading    = New-Item 'No reading yet'; $miReading.Enabled = $false
 $miRead       = New-Item 'Read clock now'
 $miReadAranet = New-Item 'Read Aranet4 now'
 $miSync       = New-Item 'Sync clock now'
-$miTrends     = New-Item 'Show trends...'
+$miTrends     = New-Item 'Open dashboard...'
 $miConn       = New-Item 'Connection enabled'
 $miLog        = New-Item 'Log hourly to CSV'
 $miClockIvl   = New-Item 'LYWSD02 read interval'
@@ -597,7 +597,7 @@ function Sample-Aranet {
     Set-Tooltip
     $miReading.Text = Reading-Text
     if ($script:popupShown) { try { $script:popupHdr.Text = Reading-Text } catch {} }
-    if ($script:trendForm -and -not $script:trendForm.IsDisposed -and $script:trendCo2Chart) { try { Rebuild-Co2Data $script:trendCo2Chart 'Aranet4 (air quality)' } catch {} }
+    Refresh-Dashboard
 }
 
 function Read-JobJson($j) {
@@ -652,12 +652,7 @@ function Poll-Jobs {
         Set-Tooltip
         $miReading.Text = Reading-Text
         if ($script:popupShown) { try { $script:popupHdr.Text = Reading-Text; Rebuild-ChartData $script:popupChart '' } catch {} }
-        if ($script:trendForm -and -not $script:trendForm.IsDisposed) {
-            try {
-                Rebuild-ChartData $script:trendChart ("LYWSD02   -   " + (Reading-Text))
-                if ($script:trendCo2Chart) { Rebuild-Co2Data $script:trendCo2Chart '' }
-            } catch {}
-        }
+        Refresh-Dashboard
         Refresh-Menu
     }
     if ($script:jobs.Count -eq 0) { $script:poll.Stop() }
@@ -963,38 +958,396 @@ function Rebuild-Both {
     if ($script:trendCo2Chart) { Rebuild-Co2Data $script:trendCo2Chart 'Aranet4 (air quality)' }
 }
 
+# ===========================================================================
+#  Dashboard - the main, shippable UI
+# ===========================================================================
+$script:DashTheme = @{
+    Bg     = [System.Drawing.Color]::FromArgb(18,19,24)
+    Card   = [System.Drawing.Color]::FromArgb(31,34,42)
+    Card2  = [System.Drawing.Color]::FromArgb(42,46,56)
+    Border = [System.Drawing.Color]::FromArgb(50,54,64)
+    Text   = [System.Drawing.Color]::FromArgb(234,236,242)
+    Muted  = [System.Drawing.Color]::FromArgb(140,146,162)
+    Temp   = [System.Drawing.Color]::FromArgb(255,122,89)
+    Hum    = [System.Drawing.Color]::FromArgb(72,199,142)
+    Dew    = [System.Drawing.Color]::FromArgb(86,180,239)
+    Co2    = [System.Drawing.Color]::FromArgb(232,176,64)
+    Pres   = [System.Drawing.Color]::FromArgb(167,139,238)
+    Batt   = [System.Drawing.Color]::FromArgb(120,200,210)
+    Good   = [System.Drawing.Color]::FromArgb(72,199,142)
+    Warn   = [System.Drawing.Color]::FromArgb(232,176,64)
+    Bad    = [System.Drawing.Color]::FromArgb(232,98,98)
+    Accent = [System.Drawing.Color]::FromArgb(96,140,250)
+}
+function DashFont([single]$size, [string]$style='Regular', [string]$family='Segoe UI') {
+    New-Object System.Drawing.Font($family, $size, [System.Drawing.FontStyle]$style)
+}
+function Fill-Round($g, $brush, $rect, $r) {
+    $x = [int]$rect.X; $y = [int]$rect.Y; $w = [int]$rect.Width; $h = [int]$rect.Height
+    $d = [int]$r * 2
+    if ($d -gt $w) { $d = $w }; if ($d -gt $h) { $d = $h }
+    $gp = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $gp.AddArc($x, $y, $d, $d, 180, 90)
+    $gp.AddArc(($x + $w - $d), $y, $d, $d, 270, 90)
+    $gp.AddArc(($x + $w - $d), ($y + $h - $d), $d, $d, 0, 90)
+    $gp.AddArc($x, ($y + $h - $d), $d, $d, 90, 90)
+    $gp.CloseFigure()
+    $g.FillPath($brush, $gp)
+    $gp.Dispose()
+}
+# A rounded card: a panel that paints a rounded filled rect (anti-aliased).
+function New-Card([int]$w, [int]$h, $color) {
+    $p = New-Object System.Windows.Forms.Panel
+    $p.Size = New-Object System.Drawing.Size($w, $h)
+    $p.BackColor = $script:DashTheme.Bg
+    $p.Tag = @{ Color = $color; Radius = 14 }
+    $p.Add_Paint({
+        param($s, $e)
+        $c = $this
+        $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $br = New-Object System.Drawing.SolidBrush $c.Tag.Color
+        $w = [int]$c.Width; $h = [int]$c.Height
+        Fill-Round $e.Graphics $br (New-Object System.Drawing.Rectangle(0, 0, ($w - 1), ($h - 1))) $c.Tag.Radius
+        $br.Dispose()
+    })
+    return $p
+}
+function New-Lbl($text, $font, $fore, $back, [int]$x, [int]$y) {
+    $l = New-Object System.Windows.Forms.Label
+    $l.Text = $text; $l.Font = $font; $l.ForeColor = $fore; $l.BackColor = $back
+    $l.AutoSize = $true; $l.Location = New-Object System.Drawing.Point($x, $y)
+    return $l
+}
+# Draw a pill toggle into a panel given an on/off state.
+function Draw-Toggle($g, $panel, [bool]$on) {
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    try { $g.Clear($panel.Parent.Tag.Color) } catch { $g.Clear($script:DashTheme.Card) }
+    $pw = [int]$panel.Width; $ph = [int]$panel.Height
+    $track = if ($on) { $script:DashTheme.Good } else { [System.Drawing.Color]::FromArgb(74,78,90) }
+    $br = New-Object System.Drawing.SolidBrush $track
+    Fill-Round $g $br (New-Object System.Drawing.Rectangle(0, 0, ($pw - 1), ($ph - 1))) ([int]($ph/2))
+    $br.Dispose()
+    $kd = $ph - 8
+    $kx = if ($on) { $pw - $kd - 4 } else { 4 }
+    $g.FillEllipse([System.Drawing.Brushes]::White, $kx, 4, $kd, $kd)
+}
+# A metric tile. Returns @{ Card; Value; Sub; Pill }.
+function New-MetricTile($title, $accent) {
+    $card = New-Card 170 128 $script:DashTheme.Card
+    $cc = $script:DashTheme.Card
+    $lt = New-Lbl $title (DashFont 10) $script:DashTheme.Muted $cc 18 16
+    $lv = New-Lbl '--' (DashFont 28 'Bold') $accent $cc 16 40
+    $ls = New-Lbl '' (DashFont 8.5) $script:DashTheme.Muted $cc 18 92
+    $card.Controls.Add($lt); $card.Controls.Add($lv); $card.Controls.Add($ls)
+    # status pill (used by CO2 tile)
+    $pill = New-Object System.Windows.Forms.Label
+    $pill.AutoSize = $false; $pill.Size = New-Object System.Drawing.Size(60, 20)
+    $pill.Location = New-Object System.Drawing.Point(96, 16); $pill.TextAlign = 'MiddleCenter'
+    $pill.Font = DashFont 8 'Bold'; $pill.ForeColor = [System.Drawing.Color]::White; $pill.BackColor = $cc
+    $pill.Visible = $false
+    $card.Controls.Add($pill)
+    return @{ Card = $card; Value = $lv; Sub = $ls; Pill = $pill }
+}
+function Restyle-Seg($btns, $current, $accent) {
+    foreach ($b in $btns) {
+        if ([int]$b.Tag -eq [int]$current) { $b.BackColor = $accent; $b.ForeColor = [System.Drawing.Color]::White }
+        else { $b.BackColor = $script:DashTheme.Card2; $b.ForeColor = $script:DashTheme.Muted }
+    }
+}
+function New-DashButton($text, $accent) {
+    $b = New-Object System.Windows.Forms.Button
+    $b.Text = $text; $b.Font = DashFont 9.5 'Bold'; $b.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $b.FlatAppearance.BorderSize = 0; $b.BackColor = $accent; $b.ForeColor = [System.Drawing.Color]::White
+    $b.Size = New-Object System.Drawing.Size(150, 38); $b.Cursor = [System.Windows.Forms.Cursors]::Hand
+    return $b
+}
+
+function Update-Dash-Controls {
+    if (-not ($script:dash -and $script:dash.Form -and -not $script:dash.Form.IsDisposed)) { return }
+    foreach ($t in @($script:dash.ConnTog, $script:dash.AranetTog, $script:dash.LogTog, $script:dash.StartupTog)) { if ($t) { $t.Invalidate() } }
+    Restyle-Seg $script:dash.ClockBtns ([int]$script:settings.IntervalMinutes) $script:DashTheme.Temp
+    Restyle-Seg $script:dash.AranetBtns ([int]$script:settings.AranetIntervalMinutes) $script:DashTheme.Co2
+}
+
+function Refresh-Dashboard {
+    if (-not ($script:dash -and $script:dash.Form -and -not $script:dash.Form.IsDisposed)) { return }
+    $T = $script:DashTheme
+    $deg = [char]0x00B0; $dot = [char]0x00B7   # avoid literal non-ASCII (PS 5.1 misreads it)
+    $r = $script:lastReading; $a = $script:lastAranet
+    # CO2 + pressure (Aranet)
+    if ($a) {
+        $col = switch ($a.Status) { 'green' { $T.Good } 'amber' { $T.Warn } 'red' { $T.Bad } default { $T.Co2 } }
+        $script:dash.Tiles.co2.Value.Text = "$([int]$a.Co2)"
+        $script:dash.Tiles.co2.Value.ForeColor = $col
+        $script:dash.Tiles.co2.Sub.Text = "ppm   $dot   $($a.When.ToString('HH:mm'))"
+        $script:dash.Tiles.co2.Pill.Visible = $true
+        $script:dash.Tiles.co2.Pill.Text = (@{green='GOOD';amber='FAIR';red='POOR'}[$a.Status])
+        $script:dash.Tiles.co2.Pill.BackColor = $col
+        $script:dash.Tiles.pres.Value.Text = ("{0:0.0}" -f $a.Pres)
+        $script:dash.Tiles.pres.Sub.Text = "hPa   $dot   Aranet4"
+    }
+    # Temp / humidity / dew (LYWSD02)
+    if ($r) {
+        $script:dash.Tiles.temp.Value.Text = ("{0:0.0}$deg" -f $r.TempC)
+        $script:dash.Tiles.temp.Sub.Text = "$($deg)C   $dot   LYWSD02   $dot   $($r.When.ToString('HH:mm'))"
+        $script:dash.Tiles.hum.Value.Text = ("{0}%" -f [int]$r.Humidity)
+        $script:dash.Tiles.hum.Sub.Text = "humidity   $dot   LYWSD02"
+        $dew = Get-Dewpoint $r.TempC $r.Humidity
+        $script:dash.Tiles.dew.Value.Text = ("{0:0.0}$deg" -f $dew)
+        $script:dash.Tiles.dew.Sub.Text = "dew point   $dot   $($deg)C"
+    }
+    # Battery (both)
+    $cb = if ($r -and $null -ne $r.Battery) { [int]$r.Battery } else { $null }
+    $ab = if ($a -and $null -ne $a.Battery) { [int]$a.Battery } else { $null }
+    if ($null -ne $cb) {
+        $script:dash.Tiles.batt.Value.Text = "$cb%"
+        $bc = if ($cb -lt 15) { $T.Bad } elseif ($cb -lt 35) { $T.Warn } else { $T.Good }
+        $script:dash.Tiles.batt.Value.ForeColor = $bc
+    }
+    $abTxt = if ($null -ne $ab) { "$ab%" } else { '--' }
+    $script:dash.Tiles.batt.Sub.Text = "LYWSD02   $dot   Aranet $abTxt"
+    # Header status + time
+    if ($script:settings.ConnectionEnabled) {
+        $script:dash.Status.Text = '  Live'; $script:dash.Status.ForeColor = $T.Good
+    } else {
+        $script:dash.Status.Text = '  Paused'; $script:dash.Status.ForeColor = $T.Muted
+    }
+    $script:dash.Updated.Text = "updated $(Get-Date -Format 'HH:mm:ss')"
+    Rebuild-Both
+}
+
+function Show-Dashboard {
+    try {
+        if ($script:dash -and $script:dash.Form -and -not $script:dash.Form.IsDisposed) {
+            $script:dash.Form.WindowState = [System.Windows.Forms.FormWindowState]::Normal
+            $script:dash.Form.Activate(); Refresh-Dashboard; return
+        }
+        $T = $script:DashTheme
+        $script:dash = @{ Tiles = @{}; ClockBtns = @(); AranetBtns = @() }
+
+        $f = New-Object System.Windows.Forms.Form
+        $f.Text = 'Sensor Dashboard'
+        $f.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+        $f.Size = New-Object System.Drawing.Size(1180, 820)
+        $f.MinimumSize = New-Object System.Drawing.Size(560, 480)
+        $f.BackColor = $T.Bg
+        $f.Font = DashFont 9
+        try { $f.Icon = [System.Drawing.Icon]::FromHandle($script:iconHandle) } catch {}
+
+        # Scrollable canvas (both directions). Content has a fixed design width so a
+        # horizontal scrollbar appears when the window is narrower.
+        $scroll = New-Object System.Windows.Forms.Panel
+        $scroll.Dock = [System.Windows.Forms.DockStyle]::Fill
+        $scroll.AutoScroll = $true
+        $scroll.BackColor = $T.Bg
+        $f.Controls.Add($scroll)
+        $content = New-Object System.Windows.Forms.Panel
+        $content.Size = New-Object System.Drawing.Size(1120, 1230)
+        $content.BackColor = $T.Bg
+        $scroll.Controls.Add($content)
+
+        $L = 24   # left margin
+        $W = 1072 # content inner width
+
+        # ---- Header ----
+        $content.Controls.Add((New-Lbl 'Sensor Dashboard' (DashFont 19 'Bold') $T.Text $T.Bg $L 20))
+        $script:dash.Status = New-Lbl '  Live' (DashFont 11 'Bold') $T.Good $T.Bg ($L + 220) 28
+        $content.Controls.Add($script:dash.Status)
+        $script:dash.Updated = New-Lbl '' (DashFont 9) $T.Muted $T.Bg ($L + 330) 31
+        $content.Controls.Add($script:dash.Updated)
+
+        # ---- Metric tiles ----
+        $content.Controls.Add((New-Lbl 'NOW' (DashFont 9 'Bold') $T.Muted $T.Bg $L 66))
+        $tileDefs = @(
+            @{ Key='co2';  Title='CO2';         Accent=$T.Co2 },
+            @{ Key='temp'; Title='Temperature'; Accent=$T.Temp },
+            @{ Key='hum';  Title='Humidity';    Accent=$T.Hum },
+            @{ Key='dew';  Title='Dew point';   Accent=$T.Dew },
+            @{ Key='pres'; Title='Pressure';    Accent=$T.Pres },
+            @{ Key='batt'; Title='Battery';     Accent=$T.Batt }
+        )
+        $tx = $L; $ty = 90
+        foreach ($d in $tileDefs) {
+            $tile = New-MetricTile $d.Title $d.Accent
+            $tile.Card.Location = New-Object System.Drawing.Point($tx, $ty)
+            $content.Controls.Add($tile.Card)
+            $script:dash.Tiles[$d.Key] = $tile
+            $tx += 184
+        }
+
+        # ---- Trends ----
+        $content.Controls.Add((New-Lbl 'TRENDS' (DashFont 9 'Bold') $T.Muted $T.Bg $L 238))
+        # range selector (owner-drawn dark combo)
+        $script:cbRange = New-Object System.Windows.Forms.ComboBox
+        $script:cbRange.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+        $script:cbRange.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+        $script:cbRange.BackColor = $T.Card2; $script:cbRange.ForeColor = $T.Text
+        $script:cbRange.Width = 150; $script:cbRange.Location = New-Object System.Drawing.Point(($L + $W - 150), 232)
+        $script:cbRange.DrawMode = [System.Windows.Forms.DrawMode]::OwnerDrawFixed
+        $script:cbRange.Add_DrawItem({
+            param($s, $e)
+            $sel = ($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0
+            $bg = if ($sel) { $script:DashTheme.Accent } else { $script:DashTheme.Card2 }
+            $bb = New-Object System.Drawing.SolidBrush $bg; $e.Graphics.FillRectangle($bb, $e.Bounds); $bb.Dispose()
+            if ($e.Index -ge 0) {
+                $tb = New-Object System.Drawing.SolidBrush $script:DashTheme.Text
+                $e.Graphics.DrawString([string]$this.Items[$e.Index], $this.Font, $tb, $e.Bounds.X + 4, $e.Bounds.Y + 2); $tb.Dispose()
+            }
+        })
+        foreach ($k in $script:RangeMap.Keys) { [void]$script:cbRange.Items.Add($k) }
+        $curCode = $script:settings.TrendRange; if (-not $curCode) { $curCode = '7d' }
+        $curLabel = ($script:RangeMap.GetEnumerator() | Where-Object { $_.Value -eq $curCode } | Select-Object -First 1).Key
+        if (-not $curLabel) { $curLabel = 'Last 7 days' }
+        $script:cbRange.SelectedItem = $curLabel
+        $content.Controls.Add($script:cbRange)
+
+        $envChart = New-TrendChart $false; $co2Chart = New-Co2Chart $false
+        foreach ($c in @($envChart, $co2Chart)) {
+            $c.Width = $W; $c.Height = 252
+            $c.Add_MouseEnter({ try { $this.Focus() } catch {} })
+            $c.Add_MouseWheel($script:OnChartWheel)
+        }
+        $envChart.Location = New-Object System.Drawing.Point($L, 264)
+        $co2Chart.Location = New-Object System.Drawing.Point($L, 524)
+        $content.Controls.Add($envChart); $content.Controls.Add($co2Chart)
+        $script:trendChart = $envChart; $script:trendCo2Chart = $co2Chart
+
+        $script:cbRange.Add_SelectedIndexChanged({
+            try {
+                $sel = $script:cbRange.SelectedItem; if (-not $sel) { return }
+                $code = $script:RangeMap[[string]$sel]; if (-not $code) { return }
+                $script:settings.TrendRange = $code; Save-Settings
+                Rebuild-Both; Zoom-Reset
+            } catch {}
+        })
+
+        # ---- Controls ----
+        $cy = 792
+        $content.Controls.Add((New-Lbl 'CONTROLS' (DashFont 9 'Bold') $T.Muted $T.Bg $L $cy))
+        $cy += 26
+
+        # Toggle cards (2x2 grid)
+        function New-ToggleCard($title, $desc, $togRef) {
+            $card = New-Card 524 70 $T.Card
+            $card.Controls.Add((New-Lbl $title (DashFont 11 'Bold') $T.Text $T.Card 18 14))
+            $card.Controls.Add((New-Lbl $desc (DashFont 8.5) $T.Muted $T.Card 18 40))
+            $tog = New-Object System.Windows.Forms.Panel
+            $tog.Size = New-Object System.Drawing.Size(50, 26)
+            $tog.Location = New-Object System.Drawing.Point(456, 22)
+            $tog.BackColor = $T.Card; $tog.Cursor = [System.Windows.Forms.Cursors]::Hand
+            $card.Controls.Add($tog)
+            return @{ Card = $card; Tog = $tog }
+        }
+
+        $tcConn = New-ToggleCard 'Bluetooth connection' 'Master switch for all sensor reads' $null
+        $tcConn.Card.Location = New-Object System.Drawing.Point($L, $cy)
+        $script:dash.ConnTog = $tcConn.Tog
+        $tcConn.Tog.Add_Paint({ param($s,$e); Draw-Toggle $e.Graphics $this ([bool]$script:settings.ConnectionEnabled) })
+        $tcConn.Tog.Add_Click({ Toggle-Connection })
+        $content.Controls.Add($tcConn.Card)
+
+        $tcAranet = New-ToggleCard 'Track Aranet4 (CO2)' 'Listen for air-quality broadcasts' $null
+        $tcAranet.Card.Location = New-Object System.Drawing.Point(($L + 548), $cy)
+        $script:dash.AranetTog = $tcAranet.Tog
+        $tcAranet.Tog.Add_Paint({ param($s,$e); Draw-Toggle $e.Graphics $this ([bool]$script:settings.AranetEnabled) })
+        $tcAranet.Tog.Add_Click({ Toggle-Aranet })
+        $content.Controls.Add($tcAranet.Card)
+        $cy += 84
+
+        $tcLog = New-ToggleCard 'Log to CSV' 'Record history to logs\*.csv' $null
+        $tcLog.Card.Location = New-Object System.Drawing.Point($L, $cy)
+        $script:dash.LogTog = $tcLog.Tog
+        $tcLog.Tog.Add_Paint({ param($s,$e); Draw-Toggle $e.Graphics $this ([bool]$script:settings.HourlyLogging) })
+        $tcLog.Tog.Add_Click({ $script:settings.HourlyLogging = -not $script:settings.HourlyLogging; Save-Settings; $script:dash.LogTog.Invalidate(); Refresh-Menu })
+        $content.Controls.Add($tcLog.Card)
+
+        $tcStart = New-ToggleCard 'Start at login' 'Launch the widget when you sign in' $null
+        $tcStart.Card.Location = New-Object System.Drawing.Point(($L + 548), $cy)
+        $script:dash.StartupTog = $tcStart.Tog
+        $tcStart.Tog.Add_Paint({ param($s,$e); Draw-Toggle $e.Graphics $this ([bool](Test-Startup)) })
+        $tcStart.Tog.Add_Click({ Set-Startup (-not (Test-Startup)); $script:dash.StartupTog.Invalidate(); Refresh-Menu })
+        $content.Controls.Add($tcStart.Card)
+        $cy += 84
+
+        # Interval selectors (segmented)
+        function New-IntervalCard($title, $unit, $options, $accent, $current) {
+            $card = New-Card 524 78 $T.Card
+            $card.Controls.Add((New-Lbl $title (DashFont 11 'Bold') $T.Text $T.Card 18 14))
+            $btns = @()
+            $bx = 18
+            foreach ($o in $options) {
+                $b = New-Object System.Windows.Forms.Button
+                $b.Text = "$o"; $b.Tag = $o; $b.Font = DashFont 8.5 'Bold'
+                $b.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat; $b.FlatAppearance.BorderSize = 0
+                $b.Size = New-Object System.Drawing.Size(46, 30); $b.Location = New-Object System.Drawing.Point($bx, 40)
+                $b.Cursor = [System.Windows.Forms.Cursors]::Hand
+                $card.Controls.Add($b); $btns += $b; $bx += 50
+            }
+            $card.Controls.Add((New-Lbl $unit (DashFont 8.5) $T.Muted $T.Card $bx 50))
+            Restyle-Seg $btns $current $accent
+            return @{ Card = $card; Btns = $btns }
+        }
+
+        $icClock = New-IntervalCard 'Clock read interval' 'minutes' @(5,10,15,30,60) $T.Temp ([int]$script:settings.IntervalMinutes)
+        $icClock.Card.Location = New-Object System.Drawing.Point($L, $cy)
+        $script:dash.ClockBtns = $icClock.Btns
+        foreach ($b in $icClock.Btns) { $b.Add_Click({ param($s,$e); $script:settings.IntervalMinutes = [int]$s.Tag; $script:clockDue = Get-Date; Save-Settings; Update-Dash-Controls; Refresh-Menu }) }
+        $content.Controls.Add($icClock.Card)
+
+        $icAranet = New-IntervalCard 'Aranet4 read interval' 'minutes' @(1,2,3,5,10,15,30) $T.Co2 ([int]$script:settings.AranetIntervalMinutes)
+        $icAranet.Card.Location = New-Object System.Drawing.Point(($L + 548), $cy)
+        $script:dash.AranetBtns = $icAranet.Btns
+        foreach ($b in $icAranet.Btns) { $b.Add_Click({ param($s,$e); $script:settings.AranetIntervalMinutes = [int]$s.Tag; $script:aranetDue = Get-Date; Save-Settings; Update-Dash-Controls; Refresh-Menu }) }
+        $content.Controls.Add($icAranet.Card)
+        $cy += 92
+
+        # Action buttons
+        $bSync = New-DashButton 'Sync clock' $T.Accent
+        $bSync.Location = New-Object System.Drawing.Point($L, $cy); $bSync.Add_Click({ Start-Bg -Kind 'sync' -LogCsv $false -Notify $true })
+        $bReadC = New-DashButton 'Read clock' $T.Card2
+        $bReadC.Location = New-Object System.Drawing.Point(($L + 162), $cy); $bReadC.Add_Click({ Start-Bg -Kind 'read' -LogCsv $true -Notify $true })
+        $bReadA = New-DashButton 'Read Aranet4' $T.Card2
+        $bReadA.Location = New-Object System.Drawing.Point(($L + 324), $cy); $bReadA.Add_Click({ Ensure-AranetWatcher; Sample-Aranet -LogCsv $true -Notify $true; Refresh-Dashboard })
+        $bData = New-DashButton 'Open data folder' $T.Card2
+        $bData.Location = New-Object System.Drawing.Point(($L + 486), $cy); $bData.Add_Click({ Start-Process explorer.exe $LogDir })
+        $content.Controls.Add($bSync); $content.Controls.Add($bReadC); $content.Controls.Add($bReadA); $content.Controls.Add($bData)
+
+        $script:dash.Form = $f
+        $f.Add_FormClosed({ $script:dash = $null; $script:trendChart = $null; $script:trendCo2Chart = $null })
+        Refresh-Dashboard
+        $f.Show(); $f.Activate()
+    } catch { WLog "ERROR dashboard: $($_.Exception.Message) :: $($_.ScriptStackTrace)" }
+}
+
+# Connection / Aranet toggles shared by the tray menu and the dashboard.
+function Toggle-Connection {
+    $script:settings.ConnectionEnabled = -not $script:settings.ConnectionEnabled
+    Save-Settings
+    if ($script:settings.ConnectionEnabled) {
+        $script:clockDue = Get-Date; $script:aranetDue = (Get-Date).AddSeconds(20)
+        Update-Icon $script:lastText $false; Ensure-AranetWatcher; Scheduler-Tick
+    } else {
+        Stop-AranetWatcher; Update-Icon $script:lastText $true
+        $script:ni.Text = 'LYWSD02  -  connection off (battery saver)'
+    }
+    Refresh-Menu; if ($script:dash) { $script:dash.ConnTog.Invalidate(); Refresh-Dashboard }
+}
+function Toggle-Aranet {
+    $script:settings.AranetEnabled = -not $script:settings.AranetEnabled
+    Save-Settings; Refresh-Menu
+    if ($script:settings.AranetEnabled) { if ($script:settings.ConnectionEnabled) { Ensure-AranetWatcher; $script:aranetDue = (Get-Date).AddSeconds(20) } }
+    else { Stop-AranetWatcher }
+    if ($script:dash) { $script:dash.AranetTog.Invalidate() }
+}
+
 # ---- Menu handlers --------------------------------------------------------
 $miRead.Add_Click({ Start-Bg -Kind 'read' -LogCsv $true -Notify $true })
 $miReadAranet.Add_Click({ Ensure-AranetWatcher; Sample-Aranet -LogCsv $true -Notify $true })
 $miSync.Add_Click({ Start-Bg -Kind 'sync' -LogCsv $false -Notify $true })
-$miTrends.Add_Click({ Show-TrendsWindow })
-$miConn.Add_Click({
-    $script:settings.ConnectionEnabled = -not $script:settings.ConnectionEnabled
-    Save-Settings
-    if ($script:settings.ConnectionEnabled) {
-        $script:clockDue = Get-Date; $script:aranetDue = (Get-Date).AddSeconds(20)   # read clock soon, sample Aranet shortly after
-        Update-Icon $script:lastText $false
-        Ensure-AranetWatcher
-        Scheduler-Tick
-        $script:ni.ShowBalloonTip(3000,'LYWSD02','Bluetooth connection enabled.',[System.Windows.Forms.ToolTipIcon]::Info)
-    } else {
-        Stop-AranetWatcher
-        Update-Icon $script:lastText $true
-        $script:ni.Text = 'LYWSD02  -  connection off (battery saver)'
-        $script:ni.ShowBalloonTip(3000,'LYWSD02','Bluetooth connection disabled to save battery.',[System.Windows.Forms.ToolTipIcon]::Info)
-    }
-    Refresh-Menu
-})
-$miLog.Add_Click({ $script:settings.HourlyLogging = -not $script:settings.HourlyLogging; Save-Settings; Refresh-Menu })
-$miAranet.Add_Click({
-    $script:settings.AranetEnabled = -not $script:settings.AranetEnabled
-    Save-Settings; Refresh-Menu
-    if ($script:settings.AranetEnabled) {
-        if ($script:settings.ConnectionEnabled) { Ensure-AranetWatcher; $script:aranetDue = (Get-Date).AddSeconds(20) }
-    } else {
-        Stop-AranetWatcher
-    }
-})
+$miTrends.Add_Click({ Show-Dashboard })
+$miConn.Add_Click({ Toggle-Connection })
+$miLog.Add_Click({ $script:settings.HourlyLogging = -not $script:settings.HourlyLogging; Save-Settings; Refresh-Menu; if ($script:dash) { $script:dash.LogTog.Invalidate() } })
+$miAranet.Add_Click({ Toggle-Aranet })
 $miOpen.Add_Click({ Start-Process explorer.exe $LogDir })
 $miStartup.Add_Click({ Set-Startup (-not (Test-Startup)); Refresh-Menu })
 $miExit.Add_Click({
@@ -1019,7 +1372,7 @@ $script:ni.Add_MouseDown({
     $script:suppressUntil = [Environment]::TickCount + 900
     Hide-Popup
 })
-$script:ni.Add_MouseDoubleClick({ Show-TrendsWindow })
+$script:ni.Add_MouseDoubleClick({ Show-Dashboard })
 $menu.Add_Opening({ Hide-Popup })
 
 Refresh-Menu

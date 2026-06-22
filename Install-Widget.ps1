@@ -75,6 +75,7 @@ if (Test-Path $settingsPath) {
         if (-not $Address -and $old.Address) { $settings.Address = $old.Address }
         if ($null -ne $old.ConnectionEnabled) { $settings.ConnectionEnabled = [bool]$old.ConnectionEnabled }
         if ($null -ne $old.HourlyLogging)     { $settings.HourlyLogging = [bool]$old.HourlyLogging }
+        if ($old.IntervalMinutes -and -not $PSBoundParameters.ContainsKey('IntervalMinutes')) { $settings.IntervalMinutes = [int]$old.IntervalMinutes }
         if ($null -ne $old.AranetEnabled)     { $settings.AranetEnabled = [bool]$old.AranetEnabled }
         if ($old.AranetScanSeconds)           { $settings.AranetScanSeconds = [int]$old.AranetScanSeconds }
         # Preserve a saved interval unless the caller explicitly overrode it.

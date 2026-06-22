@@ -88,7 +88,7 @@ to keep it visible). **Right-click** the icon for the menu:
 | **Read clock now** | Read the LYWSD02 temperature/humidity/battery immediately (also logs). |
 | **Read Aranet4 now** | Sample the latest captured CO₂ reading immediately (also logs). |
 | **Sync clock now** | Set the clock's time over Bluetooth. |
-| **Show trends...** | Open the graphs in a resizable window. |
+| **Open dashboard...** | Open the full dashboard window. |
 | **Connection enabled / disabled** | Toggle all BLE on/off. Disabled = battery saver: icon greys out. |
 | **Log hourly to CSV** | Turn CSV logging on/off (both devices). |
 | **LYWSD02 read interval ▸** | How often to read the clock (5 / 10 / 15 / 30 / 60 min). |
@@ -100,20 +100,29 @@ to keep it visible). **Right-click** the icon for the menu:
 
 The icon shows the rounded temperature (e.g. `23`). **Hovering** pops up a
 frameless graph of temperature, humidity and dew point with the current reading
-in the header. **Clicking the popup**, **double-clicking the icon**, or
-*Show trends…* opens the same graph in a resizable window.
+in the header.
 
-In the **window**:
+## Dashboard
 
-- **Hover over any data point** to float that point's exact reading and time.
-- **Scroll the mouse wheel** over a chart to zoom the time axis in/out, centred on
-  the cursor — from the whole dataset down to a ~3-sample window. Both charts zoom
-  together so the clock and air-quality stay time-aligned; when zoomed, a
-  scrollbar appears to pan. Scrolling all the way out resets to the full view.
-- A **Range** dropdown filters the time frame: *Last hour / 6 hours / 24 hours /
-  7 days / 30 days / All*, or **Custom range…** (which reveals two date pickers).
-  The choice is remembered between sessions and **defaults to the last 7 days**.
-- **Refresh** re-reads the CSVs; **Open data** opens the `logs` folder.
+**Double-click the tray icon** (or right-click → *Open dashboard…*, or click the
+hover popup) to open the **dashboard** — a dark, modern, scrollable window that
+both shows and controls everything:
+
+- **Now** — live metric tiles for CO₂ (with a GOOD / FAIR / POOR air-quality
+  badge), temperature, humidity, dew point, pressure and battery. They update in
+  place as new readings arrive.
+- **Trends** — the two device charts (LYWSD02 on top, Aranet4 below), with a
+  **Range** selector and **mouse-wheel zoom**: scroll over a chart to zoom the
+  time axis in/out, centred on the cursor, from the whole dataset down to a
+  ~3-sample window (both charts zoom together; a scrollbar appears to pan; scroll
+  all the way out to reset). Hover a point to read its exact value and time.
+- **Controls** — toggle switches for Bluetooth connection, Aranet tracking, CSV
+  logging and start-at-login; segmented selectors for each device's read interval;
+  and buttons to sync the clock, read a device now, or open the data folder.
+
+The window **scrolls vertically and horizontally** when it's smaller than the
+content, so it stays usable at any size. Everything you change is saved and also
+reflected in the tray menu.
 
 As history grows the graph can get busy, so the range filter keeps it readable
 (and the X-axis labels switch between time-of-day and date automatically based on
