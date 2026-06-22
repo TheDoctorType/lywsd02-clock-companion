@@ -235,66 +235,58 @@ function Reading-Text {
     }
     return ($clock + $aranet)
 }
+function Style-ChartArea($chart, $area, $bg, $grid, $fg) {
+    $chart.BackColor = $bg
+    $chart.AntiAliasing = [System.Windows.Forms.DataVisualization.Charting.AntiAliasingStyles]::All
+    $chart.BorderlineWidth = 0
+    $area.BackColor = [System.Drawing.Color]::Transparent
+    $area.BorderColor = [System.Drawing.Color]::Transparent
+    foreach ($ax in @($area.AxisX, $area.AxisY, $area.AxisY2)) {
+        $ax.LineColor = $grid
+        $ax.MajorTickMark.Enabled = $false
+        $ax.LabelStyle.ForeColor = $fg
+        $ax.MajorGrid.LineColor = $grid
+        $ax.MajorGrid.LineDashStyle = [System.Windows.Forms.DataVisualization.Charting.ChartDashStyle]::Dot
+    }
+    $area.AxisX.MajorGrid.Enabled = $false   # no vertical grid - cleaner
+}
 function New-TrendChart {
     param([bool]$Compact)
     $deg   = [char]0x00B0
-    $dark  = [System.Drawing.Color]::FromArgb(24,24,28)
-    $panel = [System.Drawing.Color]::FromArgb(32,32,38)
-    $grid  = [System.Drawing.Color]::FromArgb(55,55,62)
-    $fg    = [System.Drawing.Color]::FromArgb(225,225,225)
-    $cTemp = [System.Drawing.Color]::Tomato
-    $cDew  = [System.Drawing.Color]::DeepSkyBlue
-    $cHum  = [System.Drawing.Color]::MediumSeaGreen
+    $bg    = [System.Drawing.Color]::FromArgb(18,19,24)
+    $grid  = [System.Drawing.Color]::FromArgb(42,44,52)
+    $fg    = [System.Drawing.Color]::FromArgb(165,172,188)
+    $cTemp = [System.Drawing.Color]::FromArgb(255,122,89)
+    $cDew  = [System.Drawing.Color]::FromArgb(86,180,239)
+    $cHum  = [System.Drawing.Color]::FromArgb(72,199,142)
     $chart = New-Object System.Windows.Forms.DataVisualization.Charting.Chart
-    $chart.BackColor = $dark
-    $chart.AntiAliasing = [System.Windows.Forms.DataVisualization.Charting.AntiAliasingStyles]::All
-    $area = New-Object System.Windows.Forms.DataVisualization.Charting.ChartArea('main')
-    $area.BackColor = $panel
-    $area.AxisX.LabelStyle.ForeColor = $fg; $area.AxisX.LineColor = $grid; $area.AxisX.MajorGrid.LineColor = $grid
-    $area.AxisX.LabelStyle.Format = if ($Compact) {'HH:mm'} else {'ddd HH:mm'}
+    $area  = New-Object System.Windows.Forms.DataVisualization.Charting.ChartArea('main')
+    Style-ChartArea $chart $area $bg $grid $fg
     $area.AxisX.IntervalType = [System.Windows.Forms.DataVisualization.Charting.DateTimeIntervalType]::Hours
-    # Left axis = Temperature + Dew point (deg C), colour-coded orange. Auto-fit to
-    # the data range (don't force 0) so the variation is visible.
-    $area.AxisY.LabelStyle.ForeColor = $cTemp; $area.AxisY.LineColor = $cTemp; $area.AxisY.MajorGrid.LineColor = $grid
-    $area.AxisY.IsStartedFromZero = $false
-    # Right axis = Humidity, colour-coded green. Also auto-fit. (Colour-coded axes
-    # + point markers keep it distinct from the temperature line.)
+    $area.AxisY.LabelStyle.ForeColor = $cTemp; $area.AxisY.IsStartedFromZero = $false
     $area.AxisY2.Enabled = [System.Windows.Forms.DataVisualization.Charting.AxisEnabled]::True
-    $area.AxisY2.IsStartedFromZero = $false
-    $area.AxisY2.LabelStyle.ForeColor = $cHum; $area.AxisY2.LineColor = $cHum; $area.AxisY2.MajorGrid.Enabled = $false
-    if (-not $Compact) {
-        $area.AxisY.Title  = "Temperature / Dew point  ($($deg)C)"; $area.AxisY.TitleForeColor = $cTemp
-        $area.AxisY2.Title = 'Humidity  (%)'; $area.AxisY2.TitleForeColor = $cHum
-    }
+    $area.AxisY2.IsStartedFromZero = $false; $area.AxisY2.LabelStyle.ForeColor = $cHum; $area.AxisY2.MajorGrid.Enabled = $false
     $chart.ChartAreas.Add($area)
     $P=[System.Windows.Forms.DataVisualization.Charting.AxisType]::Primary
     $S=[System.Windows.Forms.DataVisualization.Charting.AxisType]::Secondary
     $mk = {
         param($name,$legend,$axis,$color,$dash,$tip)
         $s = New-Object System.Windows.Forms.DataVisualization.Charting.Series($name)
-        $s.ChartType = [System.Windows.Forms.DataVisualization.Charting.SeriesChartType]::Line
+        $s.ChartType = [System.Windows.Forms.DataVisualization.Charting.SeriesChartType]::Spline
         $s.XValueType = [System.Windows.Forms.DataVisualization.Charting.ChartValueType]::DateTime
-        $s.BorderWidth = 2; $s.Color = $color; $s.YAxisType = $axis; $s.LegendText = $legend
-        $s.MarkerStyle = [System.Windows.Forms.DataVisualization.Charting.MarkerStyle]::Circle
-        $s.MarkerSize = if ($Compact) {5} else {6}; $s.MarkerColor = $color
-        $s.ToolTip = $tip   # floats the point's reading on hover (in the windowed view)
+        $s.BorderWidth = if ($Compact) {2} else {3}; $s.Color = $color; $s.YAxisType = $axis; $s.LegendText = $legend
+        $s.ToolTip = $tip
         if ($dash) { $s.BorderDashStyle = [System.Windows.Forms.DataVisualization.Charting.ChartDashStyle]::Dash }
         $chart.Series.Add($s)
     }
-    # Created in z-order: humidity underneath, then temperature + dew point on top.
-    & $mk 'Humidity'    "Humidity (%, right)"          $S $cHum  $false "Humidity  #VALY{0}%  @ #VALX{ddd HH:mm}"
-    & $mk 'Temperature' "Temperature ($($deg)C, left)" $P $cTemp $false "Temperature  #VALY{0.0}$($deg)C  @ #VALX{ddd HH:mm}"
-    & $mk 'Dew point'   "Dew point ($($deg)C, left)"   $P $cDew  $true  "Dew point  #VALY{0.0}$($deg)C  @ #VALX{ddd HH:mm}"
+    & $mk 'Humidity'    'Humidity (%)'              $S $cHum  $false "Humidity  #VALY{0}%  @ #VALX"
+    & $mk 'Temperature' "Temperature ($($deg)C)"    $P $cTemp $false "Temperature  #VALY{0.0}$($deg)C  @ #VALX"
+    & $mk 'Dew point'   "Dew point ($($deg)C)"      $P $cDew  $true  "Dew point  #VALY{0.0}$($deg)C  @ #VALX"
     $lg = New-Object System.Windows.Forms.DataVisualization.Charting.Legend('L')
-    $lg.BackColor = $panel; $lg.ForeColor = $fg
+    $lg.BackColor = [System.Drawing.Color]::Transparent; $lg.ForeColor = $fg
     $lg.Docking = [System.Windows.Forms.DataVisualization.Charting.Docking]::Top
-    if ($Compact) { $lg.Font = New-Object System.Drawing.Font('Segoe UI',7) }
+    $lg.Font = New-Object System.Drawing.Font('Segoe UI', $(if ($Compact) {7} else {8.5}))
     $chart.Legends.Add($lg)
-    if (-not $Compact) {
-        $ti = New-Object System.Windows.Forms.DataVisualization.Charting.Title('')
-        $ti.ForeColor = $fg; $ti.Font = New-Object System.Drawing.Font('Segoe UI',11,[System.Drawing.FontStyle]::Bold)
-        $chart.Titles.Add($ti)
-    }
     return $chart
 }
 function Rebuild-ChartData {
@@ -308,71 +300,51 @@ function Rebuild-ChartData {
         [void]$sT.Points.AddXY($r.T, $r.TempC)
         [void]$sD.Points.AddXY($r.T, $r.Dew)
     }
-    # Adapt X-axis labels to the visible span so they don't crowd.
-    if ($chart.ChartAreas.Count -gt 0) {
-        $ax = $chart.ChartAreas['main'].AxisX
-        $spanH = if ($data.Count -ge 2) { ([datetime]$data[-1].T - [datetime]$data[0].T).TotalHours } else { 1 }
-        if     ($spanH -gt 72) { $ax.LabelStyle.Format = 'MM-dd' }
-        elseif ($spanH -gt 26) { $ax.LabelStyle.Format = 'ddd HH:mm' }
-        else                   { $ax.LabelStyle.Format = 'HH:mm' }
-    }
+    Update-Granularity $chart
     if ($chart.Titles.Count -gt 0 -and $TitleText) { $chart.Titles[0].Text = $TitleText }
 }
 
 # ---- Air-quality chart (Aranet4: CO2 + pressure) --------------------------
 function New-Co2Chart {
     param([bool]$Compact)
-    $dark  = [System.Drawing.Color]::FromArgb(24,24,28)
-    $panel = [System.Drawing.Color]::FromArgb(32,32,38)
-    $grid  = [System.Drawing.Color]::FromArgb(55,55,62)
-    $fg    = [System.Drawing.Color]::FromArgb(225,225,225)
-    $cCo2  = [System.Drawing.Color]::Goldenrod
-    $cPres = [System.Drawing.Color]::MediumPurple
+    $bg    = [System.Drawing.Color]::FromArgb(18,19,24)
+    $grid  = [System.Drawing.Color]::FromArgb(42,44,52)
+    $fg    = [System.Drawing.Color]::FromArgb(165,172,188)
+    $cCo2  = [System.Drawing.Color]::FromArgb(232,176,64)
+    $cPres = [System.Drawing.Color]::FromArgb(167,139,238)
     $chart = New-Object System.Windows.Forms.DataVisualization.Charting.Chart
-    $chart.BackColor = $dark
-    $chart.AntiAliasing = [System.Windows.Forms.DataVisualization.Charting.AntiAliasingStyles]::All
-    $area = New-Object System.Windows.Forms.DataVisualization.Charting.ChartArea('main')
-    $area.BackColor = $panel
-    $area.AxisX.LabelStyle.ForeColor = $fg; $area.AxisX.LineColor = $grid; $area.AxisX.MajorGrid.LineColor = $grid
-    $area.AxisX.LabelStyle.Format = if ($Compact) {'HH:mm'} else {'ddd HH:mm'}
+    $area  = New-Object System.Windows.Forms.DataVisualization.Charting.ChartArea('main')
+    Style-ChartArea $chart $area $bg $grid $fg
     $area.AxisX.IntervalType = [System.Windows.Forms.DataVisualization.Charting.DateTimeIntervalType]::Hours
-    $area.AxisY.LabelStyle.ForeColor = $cCo2; $area.AxisY.LineColor = $cCo2; $area.AxisY.MajorGrid.LineColor = $grid
-    # Auto-fit to the data range instead of forcing 0 (CO2 never gets near 0, and
-    # pressure barely moves) so both series spread out vertically.
-    $area.AxisY.IsStartedFromZero = $false
+    $area.AxisY.LabelStyle.ForeColor = $cCo2; $area.AxisY.IsStartedFromZero = $false
     $area.AxisY2.Enabled = [System.Windows.Forms.DataVisualization.Charting.AxisEnabled]::True
-    $area.AxisY2.IsStartedFromZero = $false
-    $area.AxisY2.LabelStyle.ForeColor = $cPres; $area.AxisY2.LineColor = $cPres; $area.AxisY2.MajorGrid.Enabled = $false
-    if (-not $Compact) {
-        $area.AxisY.Title  = 'CO2 (ppm)'; $area.AxisY.TitleForeColor = $cCo2
-        $area.AxisY2.Title = 'Pressure (hPa)'; $area.AxisY2.TitleForeColor = $cPres
-    }
+    $area.AxisY2.IsStartedFromZero = $false; $area.AxisY2.LabelStyle.ForeColor = $cPres; $area.AxisY2.MajorGrid.Enabled = $false
     $chart.ChartAreas.Add($area)
     $P=[System.Windows.Forms.DataVisualization.Charting.AxisType]::Primary
     $S=[System.Windows.Forms.DataVisualization.Charting.AxisType]::Secondary
-    $mk = {
-        param($name,$legend,$axis,$color,$tip)
-        $s = New-Object System.Windows.Forms.DataVisualization.Charting.Series($name)
-        $s.ChartType = [System.Windows.Forms.DataVisualization.Charting.SeriesChartType]::Line
-        $s.XValueType = [System.Windows.Forms.DataVisualization.Charting.ChartValueType]::DateTime
-        $s.BorderWidth = 2; $s.Color = $color; $s.YAxisType = $axis; $s.LegendText = $legend
-        $s.MarkerStyle = [System.Windows.Forms.DataVisualization.Charting.MarkerStyle]::Circle
-        $s.MarkerSize = if ($Compact) {5} else {6}; $s.MarkerColor = $color
-        $s.ToolTip = $tip
-        $chart.Series.Add($s)
-    }
-    & $mk 'CO2'      'CO2 (ppm, left)'        $P $cCo2  "CO2  #VALY{0} ppm  @ #VALX{ddd HH:mm}"
-    & $mk 'Pressure' 'Pressure (hPa, right)'  $S $cPres "Pressure  #VALY{0.0} hPa  @ #VALX{ddd HH:mm}"
+    # CO2 = gradient area fill (hero), Pressure = spline line.
+    $sCo2 = New-Object System.Windows.Forms.DataVisualization.Charting.Series('CO2')
+    $sCo2.ChartType = [System.Windows.Forms.DataVisualization.Charting.SeriesChartType]::SplineArea
+    $sCo2.XValueType = [System.Windows.Forms.DataVisualization.Charting.ChartValueType]::DateTime
+    $sCo2.YAxisType = $P; $sCo2.LegendText = 'CO2 (ppm)'
+    $sCo2.Color = [System.Drawing.Color]::FromArgb(70, $cCo2)
+    $sCo2.BackGradientStyle = [System.Windows.Forms.DataVisualization.Charting.GradientStyle]::TopBottom
+    $sCo2.BackSecondaryColor = [System.Drawing.Color]::FromArgb(8, $cCo2)
+    $sCo2.BorderColor = $cCo2; $sCo2.BorderWidth = if ($Compact) {2} else {3}
+    $sCo2.ToolTip = "CO2  #VALY{0} ppm  @ #VALX"
+    $chart.Series.Add($sCo2)
+    $sPres = New-Object System.Windows.Forms.DataVisualization.Charting.Series('Pressure')
+    $sPres.ChartType = [System.Windows.Forms.DataVisualization.Charting.SeriesChartType]::Spline
+    $sPres.XValueType = [System.Windows.Forms.DataVisualization.Charting.ChartValueType]::DateTime
+    $sPres.YAxisType = $S; $sPres.LegendText = 'Pressure (hPa)'
+    $sPres.Color = $cPres; $sPres.BorderWidth = if ($Compact) {2} else {3}
+    $sPres.ToolTip = "Pressure  #VALY{0.0} hPa  @ #VALX"
+    $chart.Series.Add($sPres)
     $lg = New-Object System.Windows.Forms.DataVisualization.Charting.Legend('L')
-    $lg.BackColor = $panel; $lg.ForeColor = $fg
+    $lg.BackColor = [System.Drawing.Color]::Transparent; $lg.ForeColor = $fg
     $lg.Docking = [System.Windows.Forms.DataVisualization.Charting.Docking]::Top
-    if ($Compact) { $lg.Font = New-Object System.Drawing.Font('Segoe UI',7) }
+    $lg.Font = New-Object System.Drawing.Font('Segoe UI', $(if ($Compact) {7} else {8.5}))
     $chart.Legends.Add($lg)
-    if (-not $Compact) {
-        $ti = New-Object System.Windows.Forms.DataVisualization.Charting.Title('')
-        $ti.ForeColor = $fg; $ti.Font = New-Object System.Drawing.Font('Segoe UI',11,[System.Drawing.FontStyle]::Bold)
-        $chart.Titles.Add($ti)
-    }
     return $chart
 }
 function Rebuild-Co2Data {
@@ -385,13 +357,7 @@ function Rebuild-Co2Data {
         [void]$sC.Points.AddXY($r.T, $r.Co2)
         [void]$sP.Points.AddXY($r.T, $r.Pres)
     }
-    if ($chart.ChartAreas.Count -gt 0) {
-        $ax = $chart.ChartAreas['main'].AxisX
-        $spanH = if ($data.Count -ge 2) { ([datetime]$data[-1].T - [datetime]$data[0].T).TotalHours } else { 1 }
-        if     ($spanH -gt 72) { $ax.LabelStyle.Format = 'MM-dd' }
-        elseif ($spanH -gt 26) { $ax.LabelStyle.Format = 'ddd HH:mm' }
-        else                   { $ax.LabelStyle.Format = 'HH:mm' }
-    }
+    Update-Granularity $chart
     if ($chart.Titles.Count -gt 0 -and $TitleText) { $chart.Titles[0].Text = $TitleText }
 }
 
@@ -798,7 +764,7 @@ function Get-ChartXRange($chart) {
 }
 function Zoom-Reset {
     foreach ($c in @($script:trendChart, $script:trendCo2Chart)) {
-        if ($c) { try { $c.ChartAreas['main'].AxisX.ScaleView.ZoomReset(0) } catch {} }
+        if ($c) { try { $c.ChartAreas['main'].AxisX.ScaleView.ZoomReset(0); Update-Granularity $c } catch {} }
     }
 }
 # Apply the same absolute time window [vmin,vmax] (OADate) to both charts, each
@@ -812,6 +778,7 @@ function Zoom-Apply($vmin, $vmax) {
             $mn = [math]::Max($vmin, $r.Min); $mx = [math]::Min($vmax, $r.Max)
             if ($mx -gt $mn) { $c.ChartAreas['main'].AxisX.ScaleView.Zoom($mn, $mx) }
             else { $c.ChartAreas['main'].AxisX.ScaleView.ZoomReset(0) }
+            Update-Granularity $c   # step ticks through years/months/.../minutes
         } catch {}
     }
 }
@@ -1021,7 +988,7 @@ function New-Lbl($text, $font, $fore, $back, [int]$x, [int]$y) {
 # Draw a pill toggle into a panel given an on/off state.
 function Draw-Toggle($g, $panel, [bool]$on) {
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-    try { $g.Clear($panel.Parent.Tag.Color) } catch { $g.Clear($script:DashTheme.Card) }
+    $g.Clear($panel.BackColor)
     $pw = [int]$panel.Width; $ph = [int]$panel.Height
     $track = if ($on) { $script:DashTheme.Good } else { [System.Drawing.Color]::FromArgb(74,78,90) }
     $br = New-Object System.Drawing.SolidBrush $track
@@ -1031,22 +998,81 @@ function Draw-Toggle($g, $panel, [bool]$on) {
     $kx = if ($on) { $pw - $kd - 4 } else { 4 }
     $g.FillEllipse([System.Drawing.Brushes]::White, $kx, 4, $kd, $kd)
 }
-# A metric tile. Returns @{ Card; Value; Sub; Pill }.
-function New-MetricTile($title, $accent) {
-    $card = New-Card 170 128 $script:DashTheme.Card
-    $cc = $script:DashTheme.Card
-    $lt = New-Lbl $title (DashFont 10) $script:DashTheme.Muted $cc 18 16
-    $lv = New-Lbl '--' (DashFont 28 'Bold') $accent $cc 16 40
-    $ls = New-Lbl '' (DashFont 8.5) $script:DashTheme.Muted $cc 18 92
-    $card.Controls.Add($lt); $card.Controls.Add($lv); $card.Controls.Add($ls)
-    # status pill (used by CO2 tile)
-    $pill = New-Object System.Windows.Forms.Label
-    $pill.AutoSize = $false; $pill.Size = New-Object System.Drawing.Size(60, 20)
-    $pill.Location = New-Object System.Drawing.Point(96, 16); $pill.TextAlign = 'MiddleCenter'
-    $pill.Font = DashFont 8 'Bold'; $pill.ForeColor = [System.Drawing.Color]::White; $pill.BackColor = $cc
-    $pill.Visible = $false
-    $card.Controls.Add($pill)
-    return @{ Card = $card; Value = $lv; Sub = $ls; Pill = $pill }
+# ---- Radial gauges --------------------------------------------------------
+$script:CenterFmt = New-Object System.Drawing.StringFormat
+$script:CenterFmt.Alignment = [System.Drawing.StringAlignment]::Center
+$script:CenterFmt.LineAlignment = [System.Drawing.StringAlignment]::Center
+
+function Draw-GaugeCard($p, $g) {
+    $T = $script:DashTheme; $d = $p.Tag
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
+    $w = [int]$p.Width; $h = [int]$p.Height
+    $bg = New-Object System.Drawing.SolidBrush $T.Card
+    Fill-Round $g $bg (New-Object System.Drawing.Rectangle(0, 0, ($w - 1), ($h - 1))) 16
+    $bg.Dispose()
+    $big = [bool]$d.Big
+    # label, top-left
+    $lf = DashFont ($(if ($big) {12} else {10})) 'Bold'
+    $lb = New-Object System.Drawing.SolidBrush $T.Muted
+    $g.DrawString($d.Label, $lf, $lb, 18, 14); $lb.Dispose()
+    # arc geometry
+    $cx = $w / 2.0
+    $cy = if ($big) { $h * 0.56 } else { $h * 0.60 }
+    $r  = if ($big) { [Math]::Min($w, $h) * 0.30 } else { [Math]::Min($w, $h) * 0.30 }
+    $thick = if ($big) { 18 } else { 11 }
+    $start = 135; $sweep = 270
+    $tp = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(70,72,78,92)), $thick
+    $tp.StartCap = [System.Drawing.Drawing2D.LineCap]::Round; $tp.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
+    $g.DrawArc($tp, ($cx - $r), ($cy - $r), (2 * $r), (2 * $r), $start, $sweep); $tp.Dispose()
+    if ($null -ne $d.Value) {
+        $frac = ($d.Value - $d.Min) / [double]($d.Max - $d.Min)
+        if ($frac -lt 0) { $frac = 0 }; if ($frac -gt 1) { $frac = 1 }
+        $vc = $d.ValColor
+        if ($frac -gt 0) {
+            $vp = New-Object System.Drawing.Pen $vc, $thick
+            $vp.StartCap = [System.Drawing.Drawing2D.LineCap]::Round; $vp.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
+            $g.DrawArc($vp, ($cx - $r), ($cy - $r), (2 * $r), (2 * $r), $start, ($sweep * $frac)); $vp.Dispose()
+        }
+        # value + unit, centred in the arc
+        $vf = DashFont ($(if ($big) {34} else {21})) 'Bold'
+        $vb = New-Object System.Drawing.SolidBrush $vc
+        $rect = New-Object System.Drawing.RectangleF(0, ($cy - ($(if ($big) {26} else {17}))), $w, ($(if ($big) {44} else {30})))
+        $g.DrawString($d.Disp, $vf, $vb, $rect, $script:CenterFmt); $vb.Dispose()
+        $uf = DashFont ($(if ($big) {11} else {8.5}))
+        $ub = New-Object System.Drawing.SolidBrush $T.Muted
+        $urect = New-Object System.Drawing.RectangleF(0, ($cy + ($(if ($big) {20} else {12}))), $w, 18)
+        $g.DrawString($d.Unit, $uf, $ub, $urect, $script:CenterFmt); $ub.Dispose()
+    } else {
+        $vf = DashFont ($(if ($big) {28} else {18})) 'Bold'
+        $vb = New-Object System.Drawing.SolidBrush $T.Muted
+        $rect = New-Object System.Drawing.RectangleF(0, ($cy - 16), $w, 32)
+        $g.DrawString('--', $vf, $vb, $rect, $script:CenterFmt); $vb.Dispose()
+    }
+    # sub / status text, bottom centre
+    if ($d.Sub) {
+        $sf = DashFont ($(if ($big) {10} else {8}))
+        $subCol = if ($d.SubColor) { $d.SubColor } else { $T.Muted }
+        $sb = New-Object System.Drawing.SolidBrush $subCol
+        $srect = New-Object System.Drawing.RectangleF(0, ($h - 26), $w, 20)
+        $g.DrawString($d.Sub, $sf, $sb, $srect, $script:CenterFmt); $sb.Dispose()
+    }
+}
+# A gauge panel. min/max define the arc range; accent is the default arc colour.
+function New-Gauge($key, $label, $min, $max, $unit, $accent, [bool]$big) {
+    $w = if ($big) {360} else {174}; $h = if ($big) {236} else {150}
+    $p = New-Object System.Windows.Forms.Panel
+    $p.Size = New-Object System.Drawing.Size($w, $h)
+    $p.BackColor = $script:DashTheme.Bg
+    $p.Tag = @{ Key=$key; Label=$label; Min=$min; Max=$max; Unit=$unit; Accent=$accent; Big=$big; Value=$null; Disp='--'; ValColor=$accent; Sub=''; SubColor=$null }
+    $p.Add_Paint({ param($s, $e); Draw-GaugeCard $this $e.Graphics })
+    $script:dash.Gauges[$key] = $p
+    return $p
+}
+function Set-Gauge($key, $value, $disp, $color, $sub, $subColor) {
+    $p = $script:dash.Gauges[$key]; if (-not $p) { return }
+    $p.Tag.Value = $value; $p.Tag.Disp = $disp; $p.Tag.ValColor = $color; $p.Tag.Sub = $sub; $p.Tag.SubColor = $subColor
+    $p.Invalidate()
 }
 function Restyle-Seg($btns, $current, $accent) {
     foreach ($b in $btns) {
@@ -1061,6 +1087,55 @@ function New-DashButton($text, $accent) {
     $b.Size = New-Object System.Drawing.Size(150, 38); $b.Cursor = [System.Windows.Forms.Cursors]::Hand
     return $b
 }
+function New-DashSwitch([int]$x, [int]$y) {
+    $t = New-Object System.Windows.Forms.Panel
+    $t.Size = New-Object System.Drawing.Size(46, 24); $t.Location = New-Object System.Drawing.Point($x, $y)
+    $t.BackColor = $script:DashTheme.Bg; $t.Cursor = [System.Windows.Forms.Cursors]::Hand
+    return $t
+}
+# Build a segmented selector into $panel; returns its buttons. $setBlock is the
+# (script-scope) click handler attached to each option button.
+function New-DashSeg($panel, $label, [int]$x, $options, $accent, $current, $setBlock) {
+    $T = $script:DashTheme
+    $panel.Controls.Add((New-Lbl $label (DashFont 9) $T.Muted $T.Bg $x 66))
+    $bx = $x + 116; $btns = @()
+    foreach ($o in $options) {
+        $b = New-Object System.Windows.Forms.Button
+        $b.Text = "$o"; $b.Tag = $o; $b.Font = DashFont 8.5 'Bold'
+        $b.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat; $b.FlatAppearance.BorderSize = 0
+        $b.Size = New-Object System.Drawing.Size(40, 28); $b.Location = New-Object System.Drawing.Point($bx, 62)
+        $b.Cursor = [System.Windows.Forms.Cursors]::Hand; $b.Add_Click($setBlock)
+        $panel.Controls.Add($b); $btns += $b; $bx += 44
+    }
+    Restyle-Seg $btns $current $accent
+    return $btns
+}
+# Choose X-axis tick spacing + label format from the visible span (in hours), so
+# ticks step through years / months / weeks / days / hours / minutes as you zoom.
+function Set-XGranularity($ax, [double]$spanH) {
+    $IT = [System.Windows.Forms.DataVisualization.Charting.DateTimeIntervalType]
+    if     ($spanH -gt 17520) { $ax.IntervalType = $IT::Years;   $ax.Interval = 1; $ax.LabelStyle.Format = 'yyyy' }      # > 2 years
+    elseif ($spanH -gt 2880)  { $ax.IntervalType = $IT::Months;  $ax.Interval = 1; $ax.LabelStyle.Format = 'MMM yyyy' }  # > 4 months
+    elseif ($spanH -gt 720)   { $ax.IntervalType = $IT::Weeks;   $ax.Interval = 1; $ax.LabelStyle.Format = 'MMM d' }     # > 30 days
+    elseif ($spanH -gt 96)    { $ax.IntervalType = $IT::Days;    $ax.Interval = 1; $ax.LabelStyle.Format = 'ddd d' }     # > 4 days
+    elseif ($spanH -gt 12)    { $ax.IntervalType = $IT::Hours;   $ax.Interval = 3; $ax.LabelStyle.Format = 'ddd HH:mm' }
+    elseif ($spanH -gt 2)     { $ax.IntervalType = $IT::Hours;   $ax.Interval = 1; $ax.LabelStyle.Format = 'HH:mm' }
+    elseif ($spanH -gt 0.5)   { $ax.IntervalType = $IT::Minutes; $ax.Interval = 10; $ax.LabelStyle.Format = 'HH:mm' }
+    else                      { $ax.IntervalType = $IT::Minutes; $ax.Interval = 1; $ax.LabelStyle.Format = 'HH:mm:ss' }
+}
+function Update-Granularity($chart) {
+    if (-not $chart -or $chart.ChartAreas.Count -eq 0) { return }
+    try {
+        $ax = $chart.ChartAreas['main'].AxisX
+        $sv = $ax.ScaleView
+        $r = Get-ChartXRange $chart
+        if ($r.Count -lt 2) { return }
+        if ($sv.IsZoomed) { $spanH = ($sv.ViewMaximum - $sv.ViewMinimum) * 24 }
+        else { $spanH = ($r.Max - $r.Min) * 24 }
+        if ($spanH -le 0) { $spanH = 1 }
+        Set-XGranularity $ax $spanH
+    } catch {}
+}
 
 function Update-Dash-Controls {
     if (-not ($script:dash -and $script:dash.Form -and -not $script:dash.Form.IsDisposed)) { return }
@@ -1072,45 +1147,37 @@ function Update-Dash-Controls {
 function Refresh-Dashboard {
     if (-not ($script:dash -and $script:dash.Form -and -not $script:dash.Form.IsDisposed)) { return }
     $T = $script:DashTheme
-    $deg = [char]0x00B0; $dot = [char]0x00B7   # avoid literal non-ASCII (PS 5.1 misreads it)
+    $deg = [char]0x00B0; $dot = [char]0x00B7
     $r = $script:lastReading; $a = $script:lastAranet
-    # CO2 + pressure (Aranet)
     if ($a) {
         $col = switch ($a.Status) { 'green' { $T.Good } 'amber' { $T.Warn } 'red' { $T.Bad } default { $T.Co2 } }
-        $script:dash.Tiles.co2.Value.Text = "$([int]$a.Co2)"
-        $script:dash.Tiles.co2.Value.ForeColor = $col
-        $script:dash.Tiles.co2.Sub.Text = "ppm   $dot   $($a.When.ToString('HH:mm'))"
-        $script:dash.Tiles.co2.Pill.Visible = $true
-        $script:dash.Tiles.co2.Pill.Text = (@{green='GOOD';amber='FAIR';red='POOR'}[$a.Status])
-        $script:dash.Tiles.co2.Pill.BackColor = $col
-        $script:dash.Tiles.pres.Value.Text = ("{0:0.0}" -f $a.Pres)
-        $script:dash.Tiles.pres.Sub.Text = "hPa   $dot   Aranet4"
+        $st  = (@{green='GOOD AIR';amber='FAIR AIR';red='POOR AIR'}[$a.Status])
+        Set-Gauge 'co2'  ([double]$a.Co2)  ("$([int]$a.Co2)")        $col   $st  $col
+        Set-Gauge 'pres' ([double]$a.Pres) ("{0:0}" -f $a.Pres)      $T.Pres ("as of $($a.When.ToString('HH:mm'))") $null
+    } else {
+        Set-Gauge 'co2' $null '--' $T.Co2 'waiting...' $null
+        Set-Gauge 'pres' $null '--' $T.Pres '' $null
     }
-    # Temp / humidity / dew (LYWSD02)
     if ($r) {
-        $script:dash.Tiles.temp.Value.Text = ("{0:0.0}$deg" -f $r.TempC)
-        $script:dash.Tiles.temp.Sub.Text = "$($deg)C   $dot   LYWSD02   $dot   $($r.When.ToString('HH:mm'))"
-        $script:dash.Tiles.hum.Value.Text = ("{0}%" -f [int]$r.Humidity)
-        $script:dash.Tiles.hum.Sub.Text = "humidity   $dot   LYWSD02"
         $dew = Get-Dewpoint $r.TempC $r.Humidity
-        $script:dash.Tiles.dew.Value.Text = ("{0:0.0}$deg" -f $dew)
-        $script:dash.Tiles.dew.Sub.Text = "dew point   $dot   $($deg)C"
+        Set-Gauge 'temp' ([double]$r.TempC) ("{0:0.0}" -f $r.TempC) $T.Temp ("dew {0:0.0}$deg" -f $dew) $null
+        Set-Gauge 'hum'  ([double]$r.Humidity) ("$([int]$r.Humidity)") $T.Hum ("as of $($r.When.ToString('HH:mm'))") $null
+    } else {
+        Set-Gauge 'temp' $null '--' $T.Temp '' $null
+        Set-Gauge 'hum'  $null '--' $T.Hum '' $null
     }
-    # Battery (both)
     $cb = if ($r -and $null -ne $r.Battery) { [int]$r.Battery } else { $null }
     $ab = if ($a -and $null -ne $a.Battery) { [int]$a.Battery } else { $null }
-    if ($null -ne $cb) {
-        $script:dash.Tiles.batt.Value.Text = "$cb%"
-        $bc = if ($cb -lt 15) { $T.Bad } elseif ($cb -lt 35) { $T.Warn } else { $T.Good }
-        $script:dash.Tiles.batt.Value.ForeColor = $bc
-    }
+    $bc = if ($null -eq $cb) { $T.Batt } elseif ($cb -lt 15) { $T.Bad } elseif ($cb -lt 35) { $T.Warn } else { $T.Good }
     $abTxt = if ($null -ne $ab) { "$ab%" } else { '--' }
-    $script:dash.Tiles.batt.Sub.Text = "LYWSD02   $dot   Aranet $abTxt"
+    $battVal = if ($null -ne $cb) { [double]$cb } else { $null }
+    $battDisp = if ($null -ne $cb) { "$cb" } else { '--' }
+    Set-Gauge 'batt' $battVal $battDisp $bc "clock  $dot  Aranet $abTxt" $null
     # Header status + time
     if ($script:settings.ConnectionEnabled) {
-        $script:dash.Status.Text = '  Live'; $script:dash.Status.ForeColor = $T.Good
+        $script:dash.Status.Text = "$([char]0x25CF) Live"; $script:dash.Status.ForeColor = $T.Good
     } else {
-        $script:dash.Status.Text = '  Paused'; $script:dash.Status.ForeColor = $T.Muted
+        $script:dash.Status.Text = "$([char]0x25CF) Paused"; $script:dash.Status.ForeColor = $T.Muted
     }
     $script:dash.Updated.Text = "updated $(Get-Date -Format 'HH:mm:ss')"
     Rebuild-Both
@@ -1123,66 +1190,38 @@ function Show-Dashboard {
             $script:dash.Form.Activate(); Refresh-Dashboard; return
         }
         $T = $script:DashTheme
-        $script:dash = @{ Tiles = @{}; ClockBtns = @(); AranetBtns = @() }
+        $deg = [char]0x00B0
+        $script:dash = @{ Gauges = @{}; ClockBtns = @(); AranetBtns = @() }
 
         $f = New-Object System.Windows.Forms.Form
         $f.Text = 'Sensor Dashboard'
-        $f.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-        $f.Size = New-Object System.Drawing.Size(1180, 820)
-        $f.MinimumSize = New-Object System.Drawing.Size(560, 480)
         $f.BackColor = $T.Bg
         $f.Font = DashFont 9
         try { $f.Icon = [System.Drawing.Icon]::FromHandle($script:iconHandle) } catch {}
+        $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+        $f.Size = New-Object System.Drawing.Size([Math]::Min(1480, $wa.Width - 60), [Math]::Min(940, $wa.Height - 60))
+        $f.MinimumSize = New-Object System.Drawing.Size(940, 620)
+        $f.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
 
-        # Scrollable canvas (both directions). Content has a fixed design width so a
-        # horizontal scrollbar appears when the window is narrower.
-        $scroll = New-Object System.Windows.Forms.Panel
-        $scroll.Dock = [System.Windows.Forms.DockStyle]::Fill
-        $scroll.AutoScroll = $true
-        $scroll.BackColor = $T.Bg
-        $f.Controls.Add($scroll)
-        $content = New-Object System.Windows.Forms.Panel
-        $content.Size = New-Object System.Drawing.Size(1120, 1230)
-        $content.BackColor = $T.Bg
-        $scroll.Controls.Add($content)
-
-        $L = 24   # left margin
-        $W = 1072 # content inner width
+        # Outer layout: header (top) / body (fill) / controls (bottom).
+        $tl = New-Object System.Windows.Forms.TableLayoutPanel
+        $tl.Dock = [System.Windows.Forms.DockStyle]::Fill; $tl.BackColor = $T.Bg
+        $tl.ColumnCount = 1; $tl.RowCount = 3
+        [void]$tl.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 56)))
+        [void]$tl.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+        [void]$tl.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 168)))
 
         # ---- Header ----
-        $content.Controls.Add((New-Lbl 'Sensor Dashboard' (DashFont 19 'Bold') $T.Text $T.Bg $L 20))
-        $script:dash.Status = New-Lbl '  Live' (DashFont 11 'Bold') $T.Good $T.Bg ($L + 220) 28
-        $content.Controls.Add($script:dash.Status)
-        $script:dash.Updated = New-Lbl '' (DashFont 9) $T.Muted $T.Bg ($L + 330) 31
-        $content.Controls.Add($script:dash.Updated)
-
-        # ---- Metric tiles ----
-        $content.Controls.Add((New-Lbl 'NOW' (DashFont 9 'Bold') $T.Muted $T.Bg $L 66))
-        $tileDefs = @(
-            @{ Key='co2';  Title='CO2';         Accent=$T.Co2 },
-            @{ Key='temp'; Title='Temperature'; Accent=$T.Temp },
-            @{ Key='hum';  Title='Humidity';    Accent=$T.Hum },
-            @{ Key='dew';  Title='Dew point';   Accent=$T.Dew },
-            @{ Key='pres'; Title='Pressure';    Accent=$T.Pres },
-            @{ Key='batt'; Title='Battery';     Accent=$T.Batt }
-        )
-        $tx = $L; $ty = 90
-        foreach ($d in $tileDefs) {
-            $tile = New-MetricTile $d.Title $d.Accent
-            $tile.Card.Location = New-Object System.Drawing.Point($tx, $ty)
-            $content.Controls.Add($tile.Card)
-            $script:dash.Tiles[$d.Key] = $tile
-            $tx += 184
-        }
-
-        # ---- Trends ----
-        $content.Controls.Add((New-Lbl 'TRENDS' (DashFont 9 'Bold') $T.Muted $T.Bg $L 238))
-        # range selector (owner-drawn dark combo)
+        $header = New-Object System.Windows.Forms.Panel; $header.Dock = [System.Windows.Forms.DockStyle]::Fill; $header.BackColor = $T.Bg
+        $header.Controls.Add((New-Lbl 'Sensor Dashboard' (DashFont 17 'Bold') $T.Text $T.Bg 22 12))
+        $script:dash.Status = New-Lbl '' (DashFont 11 'Bold') $T.Good $T.Bg 232 18
+        $header.Controls.Add($script:dash.Status)
+        $header.Controls.Add((New-Lbl 'Range' (DashFont 9) $T.Muted $T.Bg 360 19))
         $script:cbRange = New-Object System.Windows.Forms.ComboBox
         $script:cbRange.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
         $script:cbRange.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
         $script:cbRange.BackColor = $T.Card2; $script:cbRange.ForeColor = $T.Text
-        $script:cbRange.Width = 150; $script:cbRange.Location = New-Object System.Drawing.Point(($L + $W - 150), 232)
+        $script:cbRange.Width = 150; $script:cbRange.Location = New-Object System.Drawing.Point(410, 15)
         $script:cbRange.DrawMode = [System.Windows.Forms.DrawMode]::OwnerDrawFixed
         $script:cbRange.Add_DrawItem({
             param($s, $e)
@@ -1199,121 +1238,89 @@ function Show-Dashboard {
         $curLabel = ($script:RangeMap.GetEnumerator() | Where-Object { $_.Value -eq $curCode } | Select-Object -First 1).Key
         if (-not $curLabel) { $curLabel = 'Last 7 days' }
         $script:cbRange.SelectedItem = $curLabel
-        $content.Controls.Add($script:cbRange)
-
-        $envChart = New-TrendChart $false; $co2Chart = New-Co2Chart $false
-        foreach ($c in @($envChart, $co2Chart)) {
-            $c.Width = $W; $c.Height = 252
-            $c.Add_MouseEnter({ try { $this.Focus() } catch {} })
-            $c.Add_MouseWheel($script:OnChartWheel)
-        }
-        $envChart.Location = New-Object System.Drawing.Point($L, 264)
-        $co2Chart.Location = New-Object System.Drawing.Point($L, 524)
-        $content.Controls.Add($envChart); $content.Controls.Add($co2Chart)
-        $script:trendChart = $envChart; $script:trendCo2Chart = $co2Chart
-
         $script:cbRange.Add_SelectedIndexChanged({
             try {
                 $sel = $script:cbRange.SelectedItem; if (-not $sel) { return }
                 $code = $script:RangeMap[[string]$sel]; if (-not $code) { return }
-                $script:settings.TrendRange = $code; Save-Settings
-                Rebuild-Both; Zoom-Reset
+                $script:settings.TrendRange = $code; Save-Settings; Rebuild-Both; Zoom-Reset
             } catch {}
         })
+        $header.Controls.Add($script:cbRange)
+        $script:dash.Updated = New-Lbl '' (DashFont 9) $T.Muted $T.Bg 580 19
+        $header.Controls.Add($script:dash.Updated)
+
+        # ---- Body: gauges (left) + charts (fill) ----
+        $body = New-Object System.Windows.Forms.TableLayoutPanel
+        $body.Dock = [System.Windows.Forms.DockStyle]::Fill; $body.BackColor = $T.Bg
+        $body.ColumnCount = 2; $body.RowCount = 1
+        [void]$body.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 410)))
+        [void]$body.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+
+        $gp = New-Object System.Windows.Forms.Panel; $gp.Dock = [System.Windows.Forms.DockStyle]::Fill; $gp.BackColor = $T.Bg
+        $gCo2 = New-Gauge 'co2' 'AIR QUALITY' 400 2000 'ppm CO2' $T.Co2 $true; $gCo2.Location = New-Object System.Drawing.Point(22, 6)
+        $gTemp = New-Gauge 'temp' 'TEMPERATURE' 10 35 "$($deg)C" $T.Temp $false; $gTemp.Location = New-Object System.Drawing.Point(22, 256)
+        $gHum  = New-Gauge 'hum'  'HUMIDITY' 0 100 '%' $T.Hum $false;            $gHum.Location  = New-Object System.Drawing.Point(214, 256)
+        $gPres = New-Gauge 'pres' 'PRESSURE' 985 1040 'hPa' $T.Pres $false;      $gPres.Location = New-Object System.Drawing.Point(22, 414)
+        $gBatt = New-Gauge 'batt' 'BATTERY' 0 100 '%' $T.Batt $false;            $gBatt.Location = New-Object System.Drawing.Point(214, 414)
+        $gp.Controls.AddRange(@($gCo2, $gTemp, $gHum, $gPres, $gBatt))
+
+        $cp = New-Object System.Windows.Forms.Panel; $cp.Dock = [System.Windows.Forms.DockStyle]::Fill; $cp.BackColor = $T.Bg; $cp.Padding = New-Object System.Windows.Forms.Padding(6, 0, 10, 8)
+        $envChart = New-TrendChart $false; $co2Chart = New-Co2Chart $false
+        foreach ($c in @($envChart, $co2Chart)) {
+            $c.Dock = [System.Windows.Forms.DockStyle]::Fill
+            $c.Add_MouseEnter({ try { $this.Focus() } catch {} })
+            $c.Add_MouseWheel($script:OnChartWheel)
+        }
+        $split = New-Object System.Windows.Forms.SplitContainer
+        $split.Dock = [System.Windows.Forms.DockStyle]::Fill; $split.Orientation = [System.Windows.Forms.Orientation]::Horizontal
+        $split.BackColor = $T.Bg; $split.Panel1MinSize = 80; $split.Panel2MinSize = 80; $split.SplitterWidth = 8
+        $split.Panel1.Controls.Add($envChart); $split.Panel2.Controls.Add($co2Chart)
+        $cp.Controls.Add($split)
+        $script:trendChart = $envChart; $script:trendCo2Chart = $co2Chart
+
+        $body.Controls.Add($gp, 0, 0); $body.Controls.Add($cp, 1, 0)
 
         # ---- Controls ----
-        $cy = 792
-        $content.Controls.Add((New-Lbl 'CONTROLS' (DashFont 9 'Bold') $T.Muted $T.Bg $L $cy))
-        $cy += 26
+        $ctl = New-Object System.Windows.Forms.Panel; $ctl.Dock = [System.Windows.Forms.DockStyle]::Fill; $ctl.BackColor = $T.Bg
+        $sep = New-Object System.Windows.Forms.Panel; $sep.BackColor = $T.Border; $sep.Height = 1; $sep.Dock = [System.Windows.Forms.DockStyle]::Top
+        $ctl.Controls.Add($sep)
+        # toggles row
+        $script:dash.ConnTog = New-DashSwitch 22 18
+        $script:dash.ConnTog.Add_Paint({ param($s,$e); Draw-Toggle $e.Graphics $this ([bool]$script:settings.ConnectionEnabled) })
+        $script:dash.ConnTog.Add_Click({ Toggle-Connection })
+        $script:dash.AranetTog = New-DashSwitch 214 18
+        $script:dash.AranetTog.Add_Paint({ param($s,$e); Draw-Toggle $e.Graphics $this ([bool]$script:settings.AranetEnabled) })
+        $script:dash.AranetTog.Add_Click({ Toggle-Aranet })
+        $script:dash.LogTog = New-DashSwitch 406 18
+        $script:dash.LogTog.Add_Paint({ param($s,$e); Draw-Toggle $e.Graphics $this ([bool]$script:settings.HourlyLogging) })
+        $script:dash.LogTog.Add_Click({ $script:settings.HourlyLogging = -not $script:settings.HourlyLogging; Save-Settings; $script:dash.LogTog.Invalidate(); Refresh-Menu })
+        $script:dash.StartupTog = New-DashSwitch 590 18
+        $script:dash.StartupTog.Add_Paint({ param($s,$e); Draw-Toggle $e.Graphics $this ([bool](Test-Startup)) })
+        $script:dash.StartupTog.Add_Click({ Set-Startup (-not (Test-Startup)); $script:dash.StartupTog.Invalidate(); Refresh-Menu })
+        $ctl.Controls.AddRange(@(
+            $script:dash.ConnTog,   (New-Lbl 'Connection'    (DashFont 9.5) $T.Text $T.Bg 76 21),
+            $script:dash.AranetTog, (New-Lbl 'Aranet CO2'    (DashFont 9.5) $T.Text $T.Bg 268 21),
+            $script:dash.LogTog,    (New-Lbl 'Log to CSV'    (DashFont 9.5) $T.Text $T.Bg 460 21),
+            $script:dash.StartupTog,(New-Lbl 'Start at login'(DashFont 9.5) $T.Text $T.Bg 644 21)
+        ))
+        # interval segmented selectors
+        $script:dash.ClockBtns = New-DashSeg $ctl 'Clock read (min)' 22 @(5,10,15,30,60) $T.Temp ([int]$script:settings.IntervalMinutes) `
+            ({ param($s,$e); $script:settings.IntervalMinutes = [int]$s.Tag; $script:clockDue = Get-Date; Save-Settings; Update-Dash-Controls; Refresh-Menu })
+        $script:dash.AranetBtns = New-DashSeg $ctl 'Aranet read (min)' 430 @(1,2,3,5,10,15,30) $T.Co2 ([int]$script:settings.AranetIntervalMinutes) `
+            ({ param($s,$e); $script:settings.AranetIntervalMinutes = [int]$s.Tag; $script:aranetDue = Get-Date; Save-Settings; Update-Dash-Controls; Refresh-Menu })
+        # action buttons
+        $bSync = New-DashButton 'Sync clock' $T.Accent; $bSync.Location = New-Object System.Drawing.Point(22, 112); $bSync.Add_Click({ Start-Bg -Kind 'sync' -LogCsv $false -Notify $true })
+        $bReadC = New-DashButton 'Read clock' $T.Card2; $bReadC.Location = New-Object System.Drawing.Point(180, 112); $bReadC.Add_Click({ Start-Bg -Kind 'read' -LogCsv $true -Notify $true })
+        $bReadA = New-DashButton 'Read Aranet4' $T.Card2; $bReadA.Location = New-Object System.Drawing.Point(338, 112); $bReadA.Add_Click({ Ensure-AranetWatcher; Sample-Aranet -LogCsv $true -Notify $true; Refresh-Dashboard })
+        $bData = New-DashButton 'Open data folder' $T.Card2; $bData.Location = New-Object System.Drawing.Point(496, 112); $bData.Add_Click({ Start-Process explorer.exe $LogDir })
+        $ctl.Controls.AddRange(@($bSync, $bReadC, $bReadA, $bData))
 
-        # Toggle cards (2x2 grid)
-        function New-ToggleCard($title, $desc, $togRef) {
-            $card = New-Card 524 70 $T.Card
-            $card.Controls.Add((New-Lbl $title (DashFont 11 'Bold') $T.Text $T.Card 18 14))
-            $card.Controls.Add((New-Lbl $desc (DashFont 8.5) $T.Muted $T.Card 18 40))
-            $tog = New-Object System.Windows.Forms.Panel
-            $tog.Size = New-Object System.Drawing.Size(50, 26)
-            $tog.Location = New-Object System.Drawing.Point(456, 22)
-            $tog.BackColor = $T.Card; $tog.Cursor = [System.Windows.Forms.Cursors]::Hand
-            $card.Controls.Add($tog)
-            return @{ Card = $card; Tog = $tog }
-        }
-
-        $tcConn = New-ToggleCard 'Bluetooth connection' 'Master switch for all sensor reads' $null
-        $tcConn.Card.Location = New-Object System.Drawing.Point($L, $cy)
-        $script:dash.ConnTog = $tcConn.Tog
-        $tcConn.Tog.Add_Paint({ param($s,$e); Draw-Toggle $e.Graphics $this ([bool]$script:settings.ConnectionEnabled) })
-        $tcConn.Tog.Add_Click({ Toggle-Connection })
-        $content.Controls.Add($tcConn.Card)
-
-        $tcAranet = New-ToggleCard 'Track Aranet4 (CO2)' 'Listen for air-quality broadcasts' $null
-        $tcAranet.Card.Location = New-Object System.Drawing.Point(($L + 548), $cy)
-        $script:dash.AranetTog = $tcAranet.Tog
-        $tcAranet.Tog.Add_Paint({ param($s,$e); Draw-Toggle $e.Graphics $this ([bool]$script:settings.AranetEnabled) })
-        $tcAranet.Tog.Add_Click({ Toggle-Aranet })
-        $content.Controls.Add($tcAranet.Card)
-        $cy += 84
-
-        $tcLog = New-ToggleCard 'Log to CSV' 'Record history to logs\*.csv' $null
-        $tcLog.Card.Location = New-Object System.Drawing.Point($L, $cy)
-        $script:dash.LogTog = $tcLog.Tog
-        $tcLog.Tog.Add_Paint({ param($s,$e); Draw-Toggle $e.Graphics $this ([bool]$script:settings.HourlyLogging) })
-        $tcLog.Tog.Add_Click({ $script:settings.HourlyLogging = -not $script:settings.HourlyLogging; Save-Settings; $script:dash.LogTog.Invalidate(); Refresh-Menu })
-        $content.Controls.Add($tcLog.Card)
-
-        $tcStart = New-ToggleCard 'Start at login' 'Launch the widget when you sign in' $null
-        $tcStart.Card.Location = New-Object System.Drawing.Point(($L + 548), $cy)
-        $script:dash.StartupTog = $tcStart.Tog
-        $tcStart.Tog.Add_Paint({ param($s,$e); Draw-Toggle $e.Graphics $this ([bool](Test-Startup)) })
-        $tcStart.Tog.Add_Click({ Set-Startup (-not (Test-Startup)); $script:dash.StartupTog.Invalidate(); Refresh-Menu })
-        $content.Controls.Add($tcStart.Card)
-        $cy += 84
-
-        # Interval selectors (segmented)
-        function New-IntervalCard($title, $unit, $options, $accent, $current) {
-            $card = New-Card 524 78 $T.Card
-            $card.Controls.Add((New-Lbl $title (DashFont 11 'Bold') $T.Text $T.Card 18 14))
-            $btns = @()
-            $bx = 18
-            foreach ($o in $options) {
-                $b = New-Object System.Windows.Forms.Button
-                $b.Text = "$o"; $b.Tag = $o; $b.Font = DashFont 8.5 'Bold'
-                $b.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat; $b.FlatAppearance.BorderSize = 0
-                $b.Size = New-Object System.Drawing.Size(46, 30); $b.Location = New-Object System.Drawing.Point($bx, 40)
-                $b.Cursor = [System.Windows.Forms.Cursors]::Hand
-                $card.Controls.Add($b); $btns += $b; $bx += 50
-            }
-            $card.Controls.Add((New-Lbl $unit (DashFont 8.5) $T.Muted $T.Card $bx 50))
-            Restyle-Seg $btns $current $accent
-            return @{ Card = $card; Btns = $btns }
-        }
-
-        $icClock = New-IntervalCard 'Clock read interval' 'minutes' @(5,10,15,30,60) $T.Temp ([int]$script:settings.IntervalMinutes)
-        $icClock.Card.Location = New-Object System.Drawing.Point($L, $cy)
-        $script:dash.ClockBtns = $icClock.Btns
-        foreach ($b in $icClock.Btns) { $b.Add_Click({ param($s,$e); $script:settings.IntervalMinutes = [int]$s.Tag; $script:clockDue = Get-Date; Save-Settings; Update-Dash-Controls; Refresh-Menu }) }
-        $content.Controls.Add($icClock.Card)
-
-        $icAranet = New-IntervalCard 'Aranet4 read interval' 'minutes' @(1,2,3,5,10,15,30) $T.Co2 ([int]$script:settings.AranetIntervalMinutes)
-        $icAranet.Card.Location = New-Object System.Drawing.Point(($L + 548), $cy)
-        $script:dash.AranetBtns = $icAranet.Btns
-        foreach ($b in $icAranet.Btns) { $b.Add_Click({ param($s,$e); $script:settings.AranetIntervalMinutes = [int]$s.Tag; $script:aranetDue = Get-Date; Save-Settings; Update-Dash-Controls; Refresh-Menu }) }
-        $content.Controls.Add($icAranet.Card)
-        $cy += 92
-
-        # Action buttons
-        $bSync = New-DashButton 'Sync clock' $T.Accent
-        $bSync.Location = New-Object System.Drawing.Point($L, $cy); $bSync.Add_Click({ Start-Bg -Kind 'sync' -LogCsv $false -Notify $true })
-        $bReadC = New-DashButton 'Read clock' $T.Card2
-        $bReadC.Location = New-Object System.Drawing.Point(($L + 162), $cy); $bReadC.Add_Click({ Start-Bg -Kind 'read' -LogCsv $true -Notify $true })
-        $bReadA = New-DashButton 'Read Aranet4' $T.Card2
-        $bReadA.Location = New-Object System.Drawing.Point(($L + 324), $cy); $bReadA.Add_Click({ Ensure-AranetWatcher; Sample-Aranet -LogCsv $true -Notify $true; Refresh-Dashboard })
-        $bData = New-DashButton 'Open data folder' $T.Card2
-        $bData.Location = New-Object System.Drawing.Point(($L + 486), $cy); $bData.Add_Click({ Start-Process explorer.exe $LogDir })
-        $content.Controls.Add($bSync); $content.Controls.Add($bReadC); $content.Controls.Add($bReadA); $content.Controls.Add($bData)
+        $tl.Controls.Add($header, 0, 0); $tl.Controls.Add($body, 0, 1); $tl.Controls.Add($ctl, 0, 2)
+        $f.Controls.Add($tl)
 
         $script:dash.Form = $f
         $f.Add_FormClosed({ $script:dash = $null; $script:trendChart = $null; $script:trendCo2Chart = $null })
+        $f.Add_Shown({ try { $split.SplitterDistance = [int]($split.Height * 0.52) } catch {} })
         Refresh-Dashboard
         $f.Show(); $f.Activate()
     } catch { WLog "ERROR dashboard: $($_.Exception.Message) :: $($_.ScriptStackTrace)" }

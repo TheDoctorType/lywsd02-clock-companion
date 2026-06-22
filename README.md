@@ -105,24 +105,25 @@ in the header.
 ## Dashboard
 
 **Double-click the tray icon** (or right-click → *Open dashboard…*, or click the
-hover popup) to open the **dashboard** — a dark, modern, scrollable window that
-both shows and controls everything:
+hover popup) to open the **dashboard** — a dark, modern window that lays out to
+fit the screen (no scrolling) and both shows and controls everything:
 
-- **Now** — live metric tiles for CO₂ (with a GOOD / FAIR / POOR air-quality
-  badge), temperature, humidity, dew point, pressure and battery. They update in
-  place as new readings arrive.
-- **Trends** — the two device charts (LYWSD02 on top, Aranet4 below), with a
-  **Range** selector and **mouse-wheel zoom**: scroll over a chart to zoom the
-  time axis in/out, centred on the cursor, from the whole dataset down to a
-  ~3-sample window (both charts zoom together; a scrollbar appears to pan; scroll
-  all the way out to reset). Hover a point to read its exact value and time.
-- **Controls** — toggle switches for Bluetooth connection, Aranet tracking, CSV
-  logging and start-at-login; segmented selectors for each device's read interval;
-  and buttons to sync the clock, read a device now, or open the data folder.
+- **Live gauges** (left) — radial gauges for CO₂ (a large air-quality gauge with
+  a GOOD / FAIR / POOR readout), temperature (with dew point), humidity, pressure
+  and battery. They animate to the new value in place as readings arrive.
+- **Charts** (centre, fill the window) — the two device charts, drawn as smooth
+  spline lines with a gradient fill under CO₂. **Scroll the mouse wheel** over a
+  chart to zoom the time axis in/out, centred on the cursor, from the whole
+  dataset down to a ~3-sample window; the **tick labels step through years →
+  months → weeks → days → hours → minutes** as you zoom. Both charts zoom
+  together, and hovering a point shows its exact value and time. A **Range**
+  selector (top) sets the time frame.
+- **Controls** (bottom) — toggle switches for Bluetooth connection, Aranet
+  tracking, CSV logging and start-at-login; segmented selectors for each device's
+  read interval; and buttons to sync the clock, read a device now, or open the
+  data folder.
 
-The window **scrolls vertically and horizontally** when it's smaller than the
-content, so it stays usable at any size. Everything you change is saved and also
-reflected in the tray menu.
+Everything you change is saved and mirrored in the tray menu.
 
 As history grows the graph can get busy, so the range filter keeps it readable
 (and the X-axis labels switch between time-of-day and date automatically based on
