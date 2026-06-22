@@ -970,12 +970,14 @@ function New-Card([int]$w, [int]$h, $color) {
     $p.Tag = @{ Color = $color; Radius = 14 }
     $p.Add_Paint({
         param($s, $e)
-        $c = $this
-        $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-        $br = New-Object System.Drawing.SolidBrush $c.Tag.Color
-        $w = [int]$c.Width; $h = [int]$c.Height
-        Fill-Round $e.Graphics $br (New-Object System.Drawing.Rectangle(0, 0, ($w - 1), ($h - 1))) $c.Tag.Radius
-        $br.Dispose()
+        try {
+            $c = $this
+            $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            $br = New-Object System.Drawing.SolidBrush $c.Tag.Color
+            $w = [int]$c.Width; $h = [int]$c.Height
+            Fill-Round $e.Graphics $br (New-Object System.Drawing.Rectangle(0, 0, ($w - 1), ($h - 1))) $c.Tag.Radius
+            $br.Dispose()
+        } catch { WLog "paint card: $($_.Exception.Message)" }
     })
     return $p
 }
@@ -990,12 +992,14 @@ function Draw-Toggle($g, $panel, [bool]$on) {
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
     $g.Clear($panel.BackColor)
     $pw = [int]$panel.Width; $ph = [int]$panel.Height
-    $track = if ($on) { $script:DashTheme.Good } else { [System.Drawing.Color]::FromArgb(74,78,90) }
+    $track = [System.Drawing.Color]::FromArgb(74,78,90)
+    if ($on) { $track = $script:DashTheme.Good }
     $br = New-Object System.Drawing.SolidBrush $track
     Fill-Round $g $br (New-Object System.Drawing.Rectangle(0, 0, ($pw - 1), ($ph - 1))) ([int]($ph/2))
     $br.Dispose()
     $kd = $ph - 8
-    $kx = if ($on) { $pw - $kd - 4 } else { 4 }
+    $kx = 4
+    if ($on) { $kx = $pw - $kd - 4 }
     $g.FillEllipse([System.Drawing.Brushes]::White, $kx, 4, $kd, $kd)
 }
 # ---- Radial gauges --------------------------------------------------------
@@ -1011,51 +1015,74 @@ function Draw-GaugeCard($p, $g) {
     $bg = New-Object System.Drawing.SolidBrush $T.Card
     Fill-Round $g $bg (New-Object System.Drawing.Rectangle(0, 0, ($w - 1), ($h - 1))) 16
     $bg.Dispose()
-    $big = [bool]$d.Big
-    # label, top-left
-    $lf = DashFont ($(if ($big) {12} else {10})) 'Bold'
+    # precompute sizes (no inline-if in argument positions -> robust in paint)
+    $lblSz = 10.0; $valSz = 21.0; $unitSz = 8.5; $emptySz = 18.0; $subSz = 8.0; $cyF = 0.60; $thick = 11.0; $vOff = 17.0; $uOff = 12.0
+    if ([bool]$d.Big) { $lblSz = 12.0; $valSz = 34.0; $unitSz = 11.0; $emptySz = 28.0; $subSz = 10.0; $cyF = 0.56; $thick = 18.0; $vOff = 26.0; $uOff = 20.0 }
+    $cx = $w / 2.0; $cy = $h * $cyF; $r = [Math]::Min($w, $h) * 0.30
     $lb = New-Object System.Drawing.SolidBrush $T.Muted
-    $g.DrawString($d.Label, $lf, $lb, 18, 14); $lb.Dispose()
-    # arc geometry
-    $cx = $w / 2.0
-    $cy = if ($big) { $h * 0.56 } else { $h * 0.60 }
-    $r  = if ($big) { [Math]::Min($w, $h) * 0.30 } else { [Math]::Min($w, $h) * 0.30 }
-    $thick = if ($big) { 18 } else { 11 }
-    $start = 135; $sweep = 270
+    $g.DrawString($d.Label, (DashFont $lblSz 'Bold'), $lb, 18, 14); $lb.Dispose()
     $tp = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(70,72,78,92)), $thick
     $tp.StartCap = [System.Drawing.Drawing2D.LineCap]::Round; $tp.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
-    $g.DrawArc($tp, ($cx - $r), ($cy - $r), (2 * $r), (2 * $r), $start, $sweep); $tp.Dispose()
+    $g.DrawArc($tp, ($cx - $r), ($cy - $r), (2 * $r), (2 * $r), 135, 270); $tp.Dispose()
     if ($null -ne $d.Value) {
         $frac = ($d.Value - $d.Min) / [double]($d.Max - $d.Min)
-        if ($frac -lt 0) { $frac = 0 }; if ($frac -gt 1) { $frac = 1 }
+        if ($frac -lt 0) { $frac = 0 }
+        if ($frac -gt 1) { $frac = 1 }
         $vc = $d.ValColor
         if ($frac -gt 0) {
             $vp = New-Object System.Drawing.Pen $vc, $thick
             $vp.StartCap = [System.Drawing.Drawing2D.LineCap]::Round; $vp.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
-            $g.DrawArc($vp, ($cx - $r), ($cy - $r), (2 * $r), (2 * $r), $start, ($sweep * $frac)); $vp.Dispose()
+            $g.DrawArc($vp, ($cx - $r), ($cy - $r), (2 * $r), (2 * $r), 135, (270 * $frac)); $vp.Dispose()
         }
-        # value + unit, centred in the arc
-        $vf = DashFont ($(if ($big) {34} else {21})) 'Bold'
         $vb = New-Object System.Drawing.SolidBrush $vc
-        $rect = New-Object System.Drawing.RectangleF(0, ($cy - ($(if ($big) {26} else {17}))), $w, ($(if ($big) {44} else {30})))
-        $g.DrawString($d.Disp, $vf, $vb, $rect, $script:CenterFmt); $vb.Dispose()
-        $uf = DashFont ($(if ($big) {11} else {8.5}))
+        $g.DrawString($d.Disp, (DashFont $valSz 'Bold'), $vb, (New-Object System.Drawing.RectangleF(0, ($cy - $vOff), $w, ($valSz + 12))), $script:CenterFmt); $vb.Dispose()
         $ub = New-Object System.Drawing.SolidBrush $T.Muted
-        $urect = New-Object System.Drawing.RectangleF(0, ($cy + ($(if ($big) {20} else {12}))), $w, 18)
-        $g.DrawString($d.Unit, $uf, $ub, $urect, $script:CenterFmt); $ub.Dispose()
+        $g.DrawString($d.Unit, (DashFont $unitSz), $ub, (New-Object System.Drawing.RectangleF(0, ($cy + $uOff), $w, 18)), $script:CenterFmt); $ub.Dispose()
     } else {
-        $vf = DashFont ($(if ($big) {28} else {18})) 'Bold'
         $vb = New-Object System.Drawing.SolidBrush $T.Muted
-        $rect = New-Object System.Drawing.RectangleF(0, ($cy - 16), $w, 32)
-        $g.DrawString('--', $vf, $vb, $rect, $script:CenterFmt); $vb.Dispose()
+        $g.DrawString('--', (DashFont $emptySz 'Bold'), $vb, (New-Object System.Drawing.RectangleF(0, ($cy - 16), $w, 32)), $script:CenterFmt); $vb.Dispose()
     }
-    # sub / status text, bottom centre
     if ($d.Sub) {
-        $sf = DashFont ($(if ($big) {10} else {8}))
-        $subCol = if ($d.SubColor) { $d.SubColor } else { $T.Muted }
+        $subCol = $T.Muted
+        if ($d.SubColor) { $subCol = $d.SubColor }
         $sb = New-Object System.Drawing.SolidBrush $subCol
-        $srect = New-Object System.Drawing.RectangleF(0, ($h - 26), $w, 20)
-        $g.DrawString($d.Sub, $sf, $sb, $srect, $script:CenterFmt); $sb.Dispose()
+        $g.DrawString($d.Sub, (DashFont $subSz), $sb, (New-Object System.Drawing.RectangleF(0, ($h - 26), $w, 20)), $script:CenterFmt); $sb.Dispose()
+    }
+}
+# Battery card: two per-device bars (clock + Aranet), each coloured by level.
+function Draw-BatteryCard($p, $g) {
+    $T = $script:DashTheme; $d = $p.Tag
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
+    $w = [int]$p.Width; $h = [int]$p.Height
+    $bg = New-Object System.Drawing.SolidBrush $T.Card
+    Fill-Round $g $bg (New-Object System.Drawing.Rectangle(0, 0, ($w - 1), ($h - 1))) 16; $bg.Dispose()
+    $lb = New-Object System.Drawing.SolidBrush $T.Muted
+    $g.DrawString('BATTERY', (DashFont 10 'Bold'), $lb, 18, 14); $lb.Dispose()
+    $rows = @(@{ Name='Clock'; Val=$d.Clock }, @{ Name='Aranet'; Val=$d.Aranet })
+    $y = 56; $barX = 80; $barW = $w - $barX - 46; $barH = 16
+    foreach ($row in $rows) {
+        $nb = New-Object System.Drawing.SolidBrush $T.Text
+        $g.DrawString($row.Name, (DashFont 9), $nb, 18, ($y - 1)); $nb.Dispose()
+        $tb = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(70,72,78,92))
+        Fill-Round $g $tb (New-Object System.Drawing.Rectangle($barX, $y, $barW, $barH)) 8; $tb.Dispose()
+        if ($null -ne $row.Val) {
+            $v = [double]$row.Val
+            if ($v -lt 0) { $v = 0 }
+            if ($v -gt 100) { $v = 100 }
+            $col = $T.Good
+            if ($v -lt 15) { $col = $T.Bad } elseif ($v -lt 35) { $col = $T.Warn }
+            $fw = [int]($barW * $v / 100.0)
+            if ($fw -lt $barH -and $v -gt 0) { $fw = $barH }
+            $fb = New-Object System.Drawing.SolidBrush $col
+            Fill-Round $g $fb (New-Object System.Drawing.Rectangle($barX, $y, $fw, $barH)) 8; $fb.Dispose()
+            $pb = New-Object System.Drawing.SolidBrush $col
+            $g.DrawString("$([int]$v)%", (DashFont 9 'Bold'), $pb, ($barX + $barW + 6), ($y - 1)); $pb.Dispose()
+        } else {
+            $pb = New-Object System.Drawing.SolidBrush $T.Muted
+            $g.DrawString('--', (DashFont 9), $pb, ($barX + $barW + 6), ($y - 1)); $pb.Dispose()
+        }
+        $y += 36
     }
 }
 # A gauge panel. min/max define the arc range; accent is the default arc colour.
@@ -1065,7 +1092,7 @@ function New-Gauge($key, $label, $min, $max, $unit, $accent, [bool]$big) {
     $p.Size = New-Object System.Drawing.Size($w, $h)
     $p.BackColor = $script:DashTheme.Bg
     $p.Tag = @{ Key=$key; Label=$label; Min=$min; Max=$max; Unit=$unit; Accent=$accent; Big=$big; Value=$null; Disp='--'; ValColor=$accent; Sub=''; SubColor=$null }
-    $p.Add_Paint({ param($s, $e); Draw-GaugeCard $this $e.Graphics })
+    $p.Add_Paint({ param($s, $e); try { Draw-GaugeCard $this $e.Graphics } catch { WLog "paint gauge: $($_.Exception.Message)" } })
     $script:dash.Gauges[$key] = $p
     return $p
 }
@@ -1073,6 +1100,20 @@ function Set-Gauge($key, $value, $disp, $color, $sub, $subColor) {
     $p = $script:dash.Gauges[$key]; if (-not $p) { return }
     $p.Tag.Value = $value; $p.Tag.Disp = $disp; $p.Tag.ValColor = $color; $p.Tag.Sub = $sub; $p.Tag.SubColor = $subColor
     $p.Invalidate()
+}
+# Battery card showing both devices' levels as separate bars.
+function New-BatteryCard($key) {
+    $p = New-Object System.Windows.Forms.Panel
+    $p.Size = New-Object System.Drawing.Size(174, 150)
+    $p.BackColor = $script:DashTheme.Bg
+    $p.Tag = @{ Clock=$null; Aranet=$null }
+    $p.Add_Paint({ param($s, $e); try { Draw-BatteryCard $this $e.Graphics } catch { WLog "paint batt: $($_.Exception.Message)" } })
+    $script:dash.Gauges[$key] = $p
+    return $p
+}
+function Set-Battery($clock, $aranet) {
+    $p = $script:dash.Gauges['batt']; if (-not $p) { return }
+    $p.Tag.Clock = $clock; $p.Tag.Aranet = $aranet; $p.Invalidate()
 }
 function Restyle-Seg($btns, $current, $accent) {
     foreach ($b in $btns) {
@@ -1166,13 +1207,9 @@ function Refresh-Dashboard {
         Set-Gauge 'temp' $null '--' $T.Temp '' $null
         Set-Gauge 'hum'  $null '--' $T.Hum '' $null
     }
-    $cb = if ($r -and $null -ne $r.Battery) { [int]$r.Battery } else { $null }
-    $ab = if ($a -and $null -ne $a.Battery) { [int]$a.Battery } else { $null }
-    $bc = if ($null -eq $cb) { $T.Batt } elseif ($cb -lt 15) { $T.Bad } elseif ($cb -lt 35) { $T.Warn } else { $T.Good }
-    $abTxt = if ($null -ne $ab) { "$ab%" } else { '--' }
-    $battVal = if ($null -ne $cb) { [double]$cb } else { $null }
-    $battDisp = if ($null -ne $cb) { "$cb" } else { '--' }
-    Set-Gauge 'batt' $battVal $battDisp $bc "clock  $dot  Aranet $abTxt" $null
+    $cb = $null; if ($r -and $null -ne $r.Battery) { $cb = [int]$r.Battery }
+    $ab = $null; if ($a -and $null -ne $a.Battery) { $ab = [int]$a.Battery }
+    Set-Battery $cb $ab
     # Header status + time
     if ($script:settings.ConnectionEnabled) {
         $script:dash.Status.Text = "$([char]0x25CF) Live"; $script:dash.Status.ForeColor = $T.Good
@@ -1225,13 +1262,16 @@ function Show-Dashboard {
         $script:cbRange.DrawMode = [System.Windows.Forms.DrawMode]::OwnerDrawFixed
         $script:cbRange.Add_DrawItem({
             param($s, $e)
-            $sel = ($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0
-            $bg = if ($sel) { $script:DashTheme.Accent } else { $script:DashTheme.Card2 }
-            $bb = New-Object System.Drawing.SolidBrush $bg; $e.Graphics.FillRectangle($bb, $e.Bounds); $bb.Dispose()
-            if ($e.Index -ge 0) {
-                $tb = New-Object System.Drawing.SolidBrush $script:DashTheme.Text
-                $e.Graphics.DrawString([string]$this.Items[$e.Index], $this.Font, $tb, $e.Bounds.X + 4, $e.Bounds.Y + 2); $tb.Dispose()
-            }
+            try {
+                $sel = ($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0
+                $bg = $script:DashTheme.Card2
+                if ($sel) { $bg = $script:DashTheme.Accent }
+                $bb = New-Object System.Drawing.SolidBrush $bg; $e.Graphics.FillRectangle($bb, $e.Bounds); $bb.Dispose()
+                if ($e.Index -ge 0) {
+                    $tb = New-Object System.Drawing.SolidBrush $script:DashTheme.Text
+                    $e.Graphics.DrawString([string]$this.Items[$e.Index], $this.Font, $tb, $e.Bounds.X + 4, $e.Bounds.Y + 2); $tb.Dispose()
+                }
+            } catch { WLog "drawitem: $($_.Exception.Message)" }
         })
         foreach ($k in $script:RangeMap.Keys) { [void]$script:cbRange.Items.Add($k) }
         $curCode = $script:settings.TrendRange; if (-not $curCode) { $curCode = '7d' }
@@ -1261,7 +1301,7 @@ function Show-Dashboard {
         $gTemp = New-Gauge 'temp' 'TEMPERATURE' 10 35 "$($deg)C" $T.Temp $false; $gTemp.Location = New-Object System.Drawing.Point(22, 256)
         $gHum  = New-Gauge 'hum'  'HUMIDITY' 0 100 '%' $T.Hum $false;            $gHum.Location  = New-Object System.Drawing.Point(214, 256)
         $gPres = New-Gauge 'pres' 'PRESSURE' 985 1040 'hPa' $T.Pres $false;      $gPres.Location = New-Object System.Drawing.Point(22, 414)
-        $gBatt = New-Gauge 'batt' 'BATTERY' 0 100 '%' $T.Batt $false;            $gBatt.Location = New-Object System.Drawing.Point(214, 414)
+        $gBatt = New-BatteryCard 'batt';                                         $gBatt.Location = New-Object System.Drawing.Point(214, 414)
         $gp.Controls.AddRange(@($gCo2, $gTemp, $gHum, $gPres, $gBatt))
 
         $cp = New-Object System.Windows.Forms.Panel; $cp.Dock = [System.Windows.Forms.DockStyle]::Fill; $cp.BackColor = $T.Bg; $cp.Padding = New-Object System.Windows.Forms.Padding(6, 0, 10, 8)
@@ -1286,16 +1326,16 @@ function Show-Dashboard {
         $ctl.Controls.Add($sep)
         # toggles row
         $script:dash.ConnTog = New-DashSwitch 22 18
-        $script:dash.ConnTog.Add_Paint({ param($s,$e); Draw-Toggle $e.Graphics $this ([bool]$script:settings.ConnectionEnabled) })
+        $script:dash.ConnTog.Add_Paint({ param($s,$e); try { Draw-Toggle $e.Graphics $this ([bool]$script:settings.ConnectionEnabled) } catch { WLog "paint tog: $($_.Exception.Message)" } })
         $script:dash.ConnTog.Add_Click({ Toggle-Connection })
         $script:dash.AranetTog = New-DashSwitch 214 18
-        $script:dash.AranetTog.Add_Paint({ param($s,$e); Draw-Toggle $e.Graphics $this ([bool]$script:settings.AranetEnabled) })
+        $script:dash.AranetTog.Add_Paint({ param($s,$e); try { Draw-Toggle $e.Graphics $this ([bool]$script:settings.AranetEnabled) } catch { WLog "paint tog: $($_.Exception.Message)" } })
         $script:dash.AranetTog.Add_Click({ Toggle-Aranet })
         $script:dash.LogTog = New-DashSwitch 406 18
-        $script:dash.LogTog.Add_Paint({ param($s,$e); Draw-Toggle $e.Graphics $this ([bool]$script:settings.HourlyLogging) })
+        $script:dash.LogTog.Add_Paint({ param($s,$e); try { Draw-Toggle $e.Graphics $this ([bool]$script:settings.HourlyLogging) } catch { WLog "paint tog: $($_.Exception.Message)" } })
         $script:dash.LogTog.Add_Click({ $script:settings.HourlyLogging = -not $script:settings.HourlyLogging; Save-Settings; $script:dash.LogTog.Invalidate(); Refresh-Menu })
         $script:dash.StartupTog = New-DashSwitch 590 18
-        $script:dash.StartupTog.Add_Paint({ param($s,$e); Draw-Toggle $e.Graphics $this ([bool](Test-Startup)) })
+        $script:dash.StartupTog.Add_Paint({ param($s,$e); try { Draw-Toggle $e.Graphics $this ([bool](Test-Startup)) } catch { WLog "paint tog: $($_.Exception.Message)" } })
         $script:dash.StartupTog.Add_Click({ Set-Startup (-not (Test-Startup)); $script:dash.StartupTog.Invalidate(); Refresh-Menu })
         $ctl.Controls.AddRange(@(
             $script:dash.ConnTog,   (New-Lbl 'Connection'    (DashFont 9.5) $T.Text $T.Bg 76 21),
