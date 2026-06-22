@@ -1060,12 +1060,19 @@ function Draw-BatteryCard($p, $g) {
     $lb = New-Object System.Drawing.SolidBrush $T.Muted
     $g.DrawString('BATTERY', (DashFont 10 'Bold'), $lb, 18, 14); $lb.Dispose()
     $rows = @(@{ Name='Clock'; Val=$d.Clock }, @{ Name='Aranet'; Val=$d.Aranet })
-    $y = 56; $barX = 80; $barW = $w - $barX - 46; $barH = 16
+    $rightFmt = New-Object System.Drawing.StringFormat
+    $rightFmt.Alignment = [System.Drawing.StringAlignment]::Far
+    $pad = 18; $barW = $w - 2 * $pad; $barH = 12
+    # Two stacked blocks (name + % on one line, full-width bar below), spaced to
+    # fill the card height regardless of how narrow/short it is resized.
+    $top = 46; $blockH = [Math]::Max(34, [int](($h - $top - 14) / 2))
+    $y = $top
     foreach ($row in $rows) {
         $nb = New-Object System.Drawing.SolidBrush $T.Text
-        $g.DrawString($row.Name, (DashFont 9), $nb, 18, ($y - 1)); $nb.Dispose()
+        $g.DrawString($row.Name, (DashFont 9), $nb, $pad, $y); $nb.Dispose()
+        $by = $y + 20
         $tb = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(70,72,78,92))
-        Fill-Round $g $tb (New-Object System.Drawing.Rectangle($barX, $y, $barW, $barH)) 8; $tb.Dispose()
+        Fill-Round $g $tb (New-Object System.Drawing.Rectangle($pad, $by, $barW, $barH)) 6; $tb.Dispose()
         if ($null -ne $row.Val) {
             $v = [double]$row.Val
             if ($v -lt 0) { $v = 0 }
@@ -1075,14 +1082,14 @@ function Draw-BatteryCard($p, $g) {
             $fw = [int]($barW * $v / 100.0)
             if ($fw -lt $barH -and $v -gt 0) { $fw = $barH }
             $fb = New-Object System.Drawing.SolidBrush $col
-            Fill-Round $g $fb (New-Object System.Drawing.Rectangle($barX, $y, $fw, $barH)) 8; $fb.Dispose()
+            Fill-Round $g $fb (New-Object System.Drawing.Rectangle($pad, $by, $fw, $barH)) 6; $fb.Dispose()
             $pb = New-Object System.Drawing.SolidBrush $col
-            $g.DrawString("$([int]$v)%", (DashFont 9 'Bold'), $pb, ($barX + $barW + 6), ($y - 1)); $pb.Dispose()
+            $g.DrawString("$([int]$v)%", (DashFont 9 'Bold'), $pb, (New-Object System.Drawing.RectangleF($pad, $y, $barW, 16)), $rightFmt); $pb.Dispose()
         } else {
             $pb = New-Object System.Drawing.SolidBrush $T.Muted
-            $g.DrawString('--', (DashFont 9), $pb, ($barX + $barW + 6), ($y - 1)); $pb.Dispose()
+            $g.DrawString('--', (DashFont 9), $pb, (New-Object System.Drawing.RectangleF($pad, $y, $barW, 16)), $rightFmt); $pb.Dispose()
         }
-        $y += 36
+        $y += $blockH
     }
 }
 # A gauge panel. min/max define the arc range; accent is the default arc colour.
@@ -1293,16 +1300,34 @@ function Show-Dashboard {
         $body = New-Object System.Windows.Forms.TableLayoutPanel
         $body.Dock = [System.Windows.Forms.DockStyle]::Fill; $body.BackColor = $T.Bg
         $body.ColumnCount = 2; $body.RowCount = 1
-        [void]$body.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 410)))
-        [void]$body.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+        [void]$body.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 32)))
+        [void]$body.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 68)))
 
-        $gp = New-Object System.Windows.Forms.Panel; $gp.Dock = [System.Windows.Forms.DockStyle]::Fill; $gp.BackColor = $T.Bg
-        $gCo2 = New-Gauge 'co2' 'AIR QUALITY' 400 2000 'ppm CO2' $T.Co2 $true; $gCo2.Location = New-Object System.Drawing.Point(22, 6)
-        $gTemp = New-Gauge 'temp' 'TEMPERATURE' 10 35 "$($deg)C" $T.Temp $false; $gTemp.Location = New-Object System.Drawing.Point(22, 256)
-        $gHum  = New-Gauge 'hum'  'HUMIDITY' 0 100 '%' $T.Hum $false;            $gHum.Location  = New-Object System.Drawing.Point(214, 256)
-        $gPres = New-Gauge 'pres' 'PRESSURE' 985 1040 'hPa' $T.Pres $false;      $gPres.Location = New-Object System.Drawing.Point(22, 414)
-        $gBatt = New-BatteryCard 'batt';                                         $gBatt.Location = New-Object System.Drawing.Point(214, 414)
-        $gp.Controls.AddRange(@($gCo2, $gTemp, $gHum, $gPres, $gBatt))
+        # Gauge column as a responsive grid so cards reflow/resize with the window
+        # instead of clipping. Draw-GaugeCard derives all geometry from the live
+        # panel size, so a Dock=Fill cell is all each card needs.
+        $gp = New-Object System.Windows.Forms.TableLayoutPanel
+        $gp.Dock = [System.Windows.Forms.DockStyle]::Fill; $gp.BackColor = $T.Bg
+        $gp.Padding = New-Object System.Windows.Forms.Padding(16, 6, 6, 6)
+        $gp.ColumnCount = 2; $gp.RowCount = 3
+        [void]$gp.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 50)))
+        [void]$gp.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 50)))
+        [void]$gp.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 40)))
+        [void]$gp.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 30)))
+        [void]$gp.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 30)))
+        $gCo2  = New-Gauge 'co2' 'AIR QUALITY' 400 2000 'ppm CO2' $T.Co2 $true
+        $gTemp = New-Gauge 'temp' 'TEMPERATURE' 10 35 "$($deg)C" $T.Temp $false
+        $gHum  = New-Gauge 'hum'  'HUMIDITY' 0 100 '%' $T.Hum $false
+        $gPres = New-Gauge 'pres' 'PRESSURE' 985 1040 'hPa' $T.Pres $false
+        $gBatt = New-BatteryCard 'batt'
+        foreach ($gc in @($gCo2, $gTemp, $gHum, $gPres, $gBatt)) {
+            $gc.Dock = [System.Windows.Forms.DockStyle]::Fill
+            $gc.Margin = New-Object System.Windows.Forms.Padding(0, 0, 12, 12)
+            $gc.MinimumSize = New-Object System.Drawing.Size(0, 0)
+        }
+        $gp.Controls.Add($gCo2, 0, 0); $gp.SetColumnSpan($gCo2, 2)
+        $gp.Controls.Add($gTemp, 0, 1); $gp.Controls.Add($gHum, 1, 1)
+        $gp.Controls.Add($gPres, 0, 2); $gp.Controls.Add($gBatt, 1, 2)
 
         $cp = New-Object System.Windows.Forms.Panel; $cp.Dock = [System.Windows.Forms.DockStyle]::Fill; $cp.BackColor = $T.Bg; $cp.Padding = New-Object System.Windows.Forms.Padding(6, 0, 10, 8)
         $envChart = New-TrendChart $false; $co2Chart = New-Co2Chart $false
