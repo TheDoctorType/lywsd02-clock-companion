@@ -120,8 +120,12 @@ dark are both first-class (toggle in the controls strip).
   rebreathed-air percentage and a plain-language note on likely focus.
 - **Live vitals** — four quiet tiles (temperature, humidity, CO₂, pressure), each
   with a 6-hour sparkline and a small trend delta. Reference, not the headline.
-- **Occupancy** — headcount inferred from the CO₂ rise/level (with thin person
-  glyphs and an activity guess), captioned *inferred, no camera*.
+- **Occupancy** — headcount from a CO₂ **mass balance** (`n ≈ ACH · V · (CO₂ −
+  outdoor) / per-person output`), using the estimated air-changes/hour and the
+  **room volume** you set in the controls strip. With thin person glyphs and an
+  activity guess, captioned with the room volume and *no camera*. A single CO₂
+  sensor can't separate people from room size, so the volume setting is what
+  makes the count meaningful — still ±1 (per-person output and ACH vary).
 - **Ventilation** — air changes per hour against a healthy 4–6 target band, with
   an estimate of time to clear if the room is vacated (derived from CO₂ decay).
 - **Comfort** — dew point and absolute humidity, with relative humidity shown on
@@ -132,8 +136,9 @@ dark are both first-class (toggle in the controls strip).
   (stepped line), with day/night shading and a "now" marker. Hover to scrub and
   read any moment; click to open the full zoomable trends graph.
 - **Controls** (slim strip) — toggles for connection, Aranet tracking, CSV logging,
-  start-at-login and **light/dark theme**; per-device read-interval selectors; and
-  buttons to sync the clock, read a device now, or open the data folder.
+  start-at-login and **light/dark theme**; per-device read-interval selectors; a
+  **room volume (m³)** setting that feeds the occupancy estimate; and buttons to
+  sync the clock, read a device now, or open the data folder.
 
 Everything you change is saved and mirrored in the tray menu. The occupancy,
 ventilation and outdoor figures are **inferences** from the five inputs

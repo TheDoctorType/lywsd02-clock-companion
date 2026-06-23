@@ -65,6 +65,7 @@ $settings = [ordered]@{
     AranetEnabled     = $true
     AranetIntervalMinutes = $AranetIntervalMinutes
     AranetScanSeconds = 150
+    RoomVolume        = 29
     TrendRange        = '7d'
     TrendFrom         = ''
     TrendTo           = ''
@@ -80,6 +81,7 @@ if (Test-Path $settingsPath) {
         if ($old.AranetScanSeconds)           { $settings.AranetScanSeconds = [int]$old.AranetScanSeconds }
         # Preserve a saved interval unless the caller explicitly overrode it.
         if ($old.AranetIntervalMinutes -and -not $PSBoundParameters.ContainsKey('AranetIntervalMinutes')) { $settings.AranetIntervalMinutes = [int]$old.AranetIntervalMinutes }
+        if ($old.RoomVolume)  { $settings.RoomVolume  = [int]$old.RoomVolume }
         if ($old.TrendRange) { $settings.TrendRange = $old.TrendRange }
         if ($old.TrendFrom)  { $settings.TrendFrom  = $old.TrendFrom }
         if ($old.TrendTo)    { $settings.TrendTo    = $old.TrendTo }

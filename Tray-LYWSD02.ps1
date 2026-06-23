@@ -46,6 +46,7 @@ $DefaultSettings = [ordered]@{
     AranetEnabled   = $true
     AranetIntervalMinutes = 5
     AranetScanSeconds = 150
+    RoomVolume      = 29        # m3 (~3 x 4 x 2.4); used by the occupancy estimate
     TrendRange      = '7d'
     TrendFrom       = ''
     TrendTo         = ''
@@ -1231,18 +1232,34 @@ function Rs-Delta($series, $prop, $cur, [double]$hours) {
     $s = Rs-Recent $series $hours; if ($s.Count -lt 1) { return 0 }
     return ($cur - [double]$s[0].$prop)
 }
-function Rs-Occupancy($a) {
-    if (-not $a) { return @{ Count=$null; Activity='waiting for sensor' } }
+# Headcount from a CO2 mass balance:  generation (n people) = ventilation removal
+#   n = ACH * V * (C - C_outdoor) / (1e6 * G)
+# where V = room volume (m3), ACH = air changes/hour (estimated from CO2 decay,
+# falling back to a typical value), G = per-person CO2 output (~0.0186 m3/h at
+# rest), C_outdoor ~ 420 ppm. Room volume comes from the RoomVolume setting -
+# without it people and volume can't be separated from a single CO2 reading.
+function Rs-Occupancy($a, $ach=$null) {
+    if (-not $a) { return @{ Count=$null; Activity='waiting for sensor'; Volume=$null } }
     $co2 = [double]$a.Co2
+    $cout = 420.0
     $s = Rs-Recent (Get-AranetSeries) 0.5; $slope = 0.0
     if ($s.Count -ge 2) { $dt = ($s[$s.Count-1].T - $s[0].T).TotalHours; if ($dt -gt 0) { $slope = ([double]$s[$s.Count-1].Co2 - [double]$s[0].Co2)/$dt } }
-    $n = 0
-    if ($co2 -lt 470 -and $slope -lt 40) { $n = 0 } elseif ($co2 -lt 650) { $n = 1 } elseif ($co2 -lt 950) { $n = 2 } else { $n = 3 }
-    if ($slope -gt 250 -and $n -lt 3) { $n++ }
+    $V = [double]$script:settings.RoomVolume; if ($V -le 0) { $V = 29 }
+    if ($null -eq $ach -or $ach -le 0) { $ach = 2.0 }   # assume a typical room when no decay seen
+    $G = 18600.0   # ppm-m3 per person-hour  (0.0186 m3/h CO2 * 1e6)
+    if ($co2 -lt ($cout + 60) -and $slope -lt 40) {
+        $n = 0
+    } else {
+        $nSteady = ($ach * $V * ($co2 - $cout)) / $G          # plateau case
+        $nRise   = ($slope * $V) / $G                          # freshly occupied, before ventilation catches up
+        $n = [int][Math]::Round([Math]::Max($nSteady, $nRise * 0.6))
+        if ($n -lt 1 -and $co2 -gt ($cout + 80)) { $n = 1 }
+        if ($n -gt 8) { $n = 8 }
+    }
     $h = (Get-Date).Hour; $act = 'one person'
     if ($n -eq 0) { $act = 'empty' } elseif ($h -ge 23 -or $h -lt 6) { $act = 'asleep' }
     elseif ($n -eq 1) { $act = 'one person' } elseif ($n -eq 2) { $act = 'two people' } else { $act = "$n people" }
-    return @{ Count=$n; Activity=$act }
+    return @{ Count=$n; Activity=$act; Volume=[int]$V }
 }
 function Rs-ACH($a) {
     $s = Rs-Recent (Get-AranetSeries) 2.0; $cout = 420.0
@@ -1445,7 +1462,8 @@ function Rs-PaintOccupancy($g, $p) {
         for ($i=0; $i -lt [Math]::Max($n,1); $i++) { $col = if ($i -lt $n) { $T.TextS } else { $T.Hairline }; Rs-Person $g ($gx+$i*22) ($pad+28) 26 $col }
     }
     Rs-Txt $g $occ.Activity $script:RsFonts.Body $T.TextS $pad ($pad+64)
-    Rs-Txt $g 'inferred, no camera' $script:RsFonts.Caption $T.TextT $pad ($p.Height-$pad-14)
+    $cap = if ($null -ne $occ.Volume) { "inferred from CO$($script:RsSub2) $($script:RsMid) $($occ.Volume) m$($script:RsSup3) room $($script:RsMid) no camera" } else { 'inferred, no camera' }
+    Rs-Txt $g $cap $script:RsFonts.Caption $T.TextT $pad ($p.Height-$pad-14)
 }
 function Rs-PaintVentilation($g, $p) {
     $T = $script:DashTheme; Ensure-RsFonts; Rs-CardBg $g $p $T
@@ -1627,7 +1645,7 @@ function Refresh-Dashboard {
     $aranetStale = ($null -ne $aranetAge -and $aranetAge -gt $aranetStaleMax)
     $clockAgeTxt  = if ($null -ne $clockAge)  { Rs-AgeText $clockAge }  else { '' }
     $aranetAgeTxt = if ($null -ne $aranetAge) { Rs-AgeText $aranetAge } else { '' }
-    $occ = Rs-Occupancy $a; $achR = Rs-ACH $a; $pt = Rs-Pressure $a; $vd = Rs-Verdict $co2 $temp $hum $occ
+    $achR = Rs-ACH $a; $occ = Rs-Occupancy $a $achR.Ach; $pt = Rs-Pressure $a; $vd = Rs-Verdict $co2 $temp $hum $occ
     $tD = [Math]::Round((Rs-Delta $sensor 'TempC' $temp 1.0),1)
     $hD = [Math]::Round((Rs-Delta $sensor 'Hum' $hum 1.0),0)
     $cD = [Math]::Round((Rs-Delta $aranet 'Co2' $co2 1.0),0)
@@ -1801,6 +1819,16 @@ function Show-Dashboard {
         $bReadA = New-DashButton 'Read Aranet4' $T.Sunken $T.TextP; $bReadA.Location = New-Object System.Drawing.Point(320, 104); $bReadA.Add_Click({ Ensure-AranetWatcher; Sample-Aranet -LogCsv $true -Notify $true; Refresh-Dashboard })
         $bData = New-DashButton 'Open data folder' $T.Sunken $T.TextP; $bData.Location = New-Object System.Drawing.Point(478, 104); $bData.Add_Click({ Start-Process explorer.exe $LogDir })
         $ctl.Controls.AddRange(@($bSync, $bReadC, $bReadA, $bData))
+        # room volume (m3) - feeds the occupancy mass-balance estimate
+        $lblVol = New-Lbl ('Room volume (m'+$script:RsSup3+')') (DashFont 9.5) $T.TextS $T.Canvas 648 114
+        $numVol = New-Object System.Windows.Forms.NumericUpDown
+        $numVol.Minimum = 5; $numVol.Maximum = 1000; $numVol.Increment = 1; $numVol.Font = DashFont 10
+        $numVol.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+        $numVol.BackColor = $T.Sunken; $numVol.ForeColor = $T.TextP
+        $numVol.Location = New-Object System.Drawing.Point(772, 110); $numVol.Width = 66
+        $numVol.Value = [decimal][Math]::Min(1000, [Math]::Max(5, [int]$script:settings.RoomVolume))
+        $numVol.Add_ValueChanged({ $script:settings.RoomVolume = [int]$this.Value; Save-Settings; if ($script:dash) { Refresh-Dashboard } })
+        $ctl.Controls.AddRange(@($lblVol, $numVol))
 
         # ---- Footer ----
         $footer = New-Object Vulcan.CardPanel; $footer.BackColor = $T.Canvas; $footer.Dock = [System.Windows.Forms.DockStyle]::Fill
