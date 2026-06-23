@@ -527,12 +527,19 @@ function Ensure-AranetWatcher {
     if (-not $script:settings.ConnectionEnabled) { return }
     if (-not $script:settings.AranetEnabled) { return }
     if (Job-Active 'clock') { return }   # never scan while the clock read is using the radio
-    if ($script:aranetWatcherPid) {
-        $alive = $false
-        try { $alive = [bool](Get-Process -Id $script:aranetWatcherPid -ErrorAction SilentlyContinue) } catch {}
-        if ($alive) { return }
+    # Reconcile to EXACTLY one watcher: duplicate advertisement watchers fight for
+    # the radio and drop broadcasts, so keep the newest and kill any extras.
+    $procs = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+               Where-Object { $_.CommandLine -like '*-File*Watch-Aranet4.ps1*' })
+    if ($procs.Count -ge 1) {
+        $keep = $procs | Sort-Object CreationDate -Descending | Select-Object -First 1
+        if ($procs.Count -gt 1) {
+            $procs | Where-Object { $_.ProcessId -ne $keep.ProcessId } | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
+            WLog "INFO killed $($procs.Count - 1) duplicate aranet watcher(s)"
+        }
+        $script:aranetWatcherPid = $keep.ProcessId
+        return
     }
-    Stop-AranetWatcher
     try {
         $p = Start-Process -FilePath 'powershell.exe' -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$WatchScript`"" -WindowStyle Hidden -PassThru
         $script:aranetWatcherPid = $p.Id
@@ -551,9 +558,13 @@ function Sample-Aranet {
     }
     $ts = [string]$data.ts
     $isNew = ($ts -ne $script:lastAranetTs)
+    # Stamp the reading with the broadcast capture time (data.ts), NOT the moment
+    # we read the file - otherwise a stale latest.json always looks "fresh".
+    $when = Get-Date
+    try { if ($ts) { $when = [datetime]::Parse($ts) } } catch {}
     $script:lastAranet = @{
         Co2=[int]$data.co2; TempC=[double]$data.tempC; Hum=[int]$data.humidity;
-        Pres=[double]$data.pressure; Battery=$data.battery; Status=[string]$data.status; When=(Get-Date)
+        Pres=[double]$data.pressure; Battery=$data.battery; Status=[string]$data.status; When=$when
     }
     if ($isNew) {
         $script:lastAranetTs = $ts
@@ -1578,13 +1589,13 @@ function Rs-PaintFooter($g, $p) {
     $cbt = if ($null -ne $cb) { "clock $cb%" } else { 'clock --' }
     $abt = if ($null -ne $ab) { "Aranet $ab%" } else { 'Aranet --' }
     $conn = if ($script:settings.ConnectionEnabled) { 'live' } else { 'paused' }
-    $fresh = if ($script:rs.AnyStale) { 'sensor stale' } else { 'sensors fresh' }
+    $air = if ($script:rs.AranetWhen) { "CO$($script:RsSub2) as of $($script:rs.AranetWhen.ToString('HH:mm'))" } else { "CO$($script:RsSub2) --" }
     $tx = 4
     # a single caution dot only if a sensor has gone stale / offline
     if ($script:rs.AnyStale -or -not $script:settings.ConnectionEnabled) {
         $db = New-Object Drawing.SolidBrush $T.Caution; $g.FillEllipse($db, [single]4, [single]11, [single]7, [single]7); $db.Dispose(); $tx = 16
     }
-    $txt = "updated $($script:rs.Updated.ToString('HH:mm:ss'))   $($script:RsMid)   $conn   $($script:RsMid)   $fresh   $($script:RsMid)   $cbt   $($script:RsMid)   $abt"
+    $txt = "updated $($script:rs.Updated.ToString('HH:mm:ss'))   $($script:RsMid)   $conn   $($script:RsMid)   $air   $($script:RsMid)   $cbt   $($script:RsMid)   $abt"
     Rs-Txt $g $txt $script:RsFonts.Caption $T.TextT $tx 8
 }
 
@@ -1663,6 +1674,7 @@ function Refresh-Dashboard {
         Verdict=$vd.Line; State=$vd.State; Rebreathed=$(if ($null -ne $co2) { Rs-Rebreathed $co2 } else { $null })
         Updated=$now; Timeline=$aranet
         Co2Stale=$aranetStale; Co2Age=$aranetAgeTxt; AnyStale=($clockStale -or $aranetStale)
+        AranetWhen=$(if ($a) { $a.When } else { $null }); ClockWhen=$(if ($r) { $r.When } else { $null })
         ClockBatt=$(if ($r -and $null -ne $r.Battery) { [int]$r.Battery } else { $null })
         AranetBatt=$(if ($a -and $null -ne $a.Battery) { [int]$a.Battery } else { $null })
         V=@{
