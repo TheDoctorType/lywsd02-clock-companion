@@ -105,29 +105,39 @@ in the header.
 ## Dashboard
 
 **Double-click the tray icon** (or right-click → *Open dashboard…*, or click the
-hover popup) to open the **dashboard** — a dark, modern window that lays out to
-fit the screen (no scrolling) and both shows and controls everything:
+hover popup) to open the **dashboard** — a *Room State* view that reads the room
+and presents the **meaning, not the raw gauges**. It leads with one plain-language
+verdict and a small set of quiet cards, each answering a human question. A healthy
+room is almost silent: one accent colour, and no motion beyond a single breathing
+dot. The interface raises its voice only when something needs attention. Light and
+dark are both first-class (toggle in the controls strip).
 
-- **Live gauges** (left) — radial gauges for CO₂ (a large air-quality gauge with
-  a GOOD / FAIR / POOR readout), temperature (with dew point), humidity, pressure
-  and battery. They animate to the new value in place as readings arrive.
-- **Charts** (centre, fill the window) — the two device charts, drawn as smooth
-  spline lines with a gradient fill under CO₂. **Scroll the mouse wheel** over a
-  chart to zoom the time axis in/out, centred on the cursor, from the whole
-  dataset down to a ~3-sample window; the **tick labels step through years →
-  months → weeks → days → hours → minutes** as you zoom. Both charts zoom
-  together, and hovering a point shows its exact value and time. A **Range**
-  selector (top) sets the time frame.
-- **Controls** (bottom) — toggle switches for Bluetooth connection, Aranet
-  tracking, CSV logging and start-at-login; segmented selectors for each device's
-  read interval; and buttons to sync the clock, read a device now, or open the
-  data folder.
+- **Room verdict** (top, flush) — one synthesised line ("Fresh and comfortable.
+  Likely one person.") with a soft state orb that breathes, and a quiet timestamp.
+- **Air quality** (feature card) — CO₂ in ppm over a low-chroma threshold band
+  (fresh / acceptable / stuffy / poor) with a marker at the current value, plus a
+  rebreathed-air percentage and a plain-language note on likely focus.
+- **Live vitals** — four quiet tiles (temperature, humidity, CO₂, pressure), each
+  with a 6-hour sparkline and a small trend delta. Reference, not the headline.
+- **Occupancy** — headcount inferred from the CO₂ rise/level (with thin person
+  glyphs and an activity guess), captioned *inferred, no camera*.
+- **Ventilation** — air changes per hour against a healthy 4–6 target band, with
+  an estimate of time to clear if the room is vacated (derived from CO₂ decay).
+- **Comfort** — dew point and absolute humidity, with relative humidity shown on
+  the shared 40–60% comfort band.
+- **Outside** — pressure tendency (rising / falling, hPa over 3h) and a one-line
+  weather nowcast, inferred through the wall (there is no outdoor sensor).
+- **Today** — a 24-hour timeline of CO₂ with day/night shading.
+- **Controls** (slim strip) — toggles for connection, Aranet tracking, CSV logging,
+  start-at-login and **light/dark theme**; per-device read-interval selectors; and
+  buttons to sync the clock, read a device now, or open the data folder.
 
-Everything you change is saved and mirrored in the tray menu.
+Everything you change is saved and mirrored in the tray menu. The occupancy,
+ventilation and outdoor figures are **inferences** from the five inputs
+(temperature, humidity, CO₂, pressure, clock), not direct measurements.
 
-As history grows the graph can get busy, so the range filter keeps it readable
-(and the X-axis labels switch between time-of-day and date automatically based on
-the visible span).
+The full zoomable trends charts (smooth splines, scroll-wheel zoom, range filter)
+live in their own window — right-click the tray icon → *Trends graph…*.
 
 Configure with `Install-Widget.ps1` parameters: `-Address`, `-IntervalMinutes`
 (clock, default 60), `-AranetIntervalMinutes` (CO₂, default 5), `-ScanSeconds`
