@@ -99,8 +99,9 @@ to keep it visible). **Right-click** the icon for the menu:
 | **Exit** | Close the widget. |
 
 The icon shows the rounded temperature (e.g. `23`). **Hovering** pops up a
-frameless graph of temperature, humidity and dew point with the current reading
-in the header.
+frameless Room State mini-summary — the plain-language verdict, the four current
+readings, and a CO₂ sparkline — styled to match the dashboard. Click it to open
+the full dashboard.
 
 ## Dashboard
 
@@ -127,7 +128,9 @@ dark are both first-class (toggle in the controls strip).
   the shared 40–60% comfort band.
 - **Outside** — pressure tendency (rising / falling, hPa over 3h) and a one-line
   weather nowcast, inferred through the wall (there is no outdoor sensor).
-- **Today** — a 24-hour timeline of CO₂ with day/night shading.
+- **Today** — a 24-hour timeline overlaying CO₂ (filled area) and occupancy
+  (stepped line), with day/night shading and a "now" marker. Hover to scrub and
+  read any moment; click to open the full zoomable trends graph.
 - **Controls** (slim strip) — toggles for connection, Aranet tracking, CSV logging,
   start-at-login and **light/dark theme**; per-device read-interval selectors; and
   buttons to sync the clock, read a device now, or open the data folder.
@@ -135,6 +138,14 @@ dark are both first-class (toggle in the controls strip).
 Everything you change is saved and mirrored in the tray menu. The occupancy,
 ventilation and outdoor figures are **inferences** from the five inputs
 (temperature, humidity, CO₂, pressure, clock), not direct measurements.
+
+Live updates are physical, never jarring: numbers tween to their new value,
+the verdict word-cross-fades, and the affected card gives a brief settle when a
+state changes. Each card also handles its own **loading** (skeleton), **empty**
+("waiting for sensor"), and **stale** (dimmed + "Xm ago") states, and a single
+caution dot appears in the footer if a sensor goes quiet. If Windows is set to
+**reduce motion**, all tweens and the breathing dot are disabled and changes
+apply instantly.
 
 The full zoomable trends charts (smooth splines, scroll-wheel zoom, range filter)
 live in their own window — right-click the tray icon → *Trends graph…*.
