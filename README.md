@@ -120,14 +120,18 @@ dark are both first-class (toggle in the controls strip).
   rebreathed-air percentage and a plain-language note on likely focus.
 - **Live vitals** — four quiet tiles (temperature, humidity, CO₂, pressure), each
   with a 6-hour sparkline and a small trend delta. Reference, not the headline.
-- **Occupancy** — headcount from a CO₂ **mass balance** (`n ≈ ACH · V · (CO₂ −
-  outdoor) / per-person output`), using the estimated air-changes/hour and the
-  **room volume** you set in the controls strip. With thin person glyphs and an
-  activity guess, captioned with the room volume and *no camera*. A single CO₂
-  sensor can't separate people from room size, so the volume setting is what
-  makes the count meaningful — still ±1 (per-person output and ACH vary).
-- **Ventilation** — air changes per hour against a healthy 4–6 target band, with
-  an estimate of time to clear if the room is vacated (derived from CO₂ decay).
+- **Occupancy** — a **qualitative band** (empty / 1–2 / several / a crowd), not an
+  exact count. It comes from a CO₂ mass balance (`n ≈ ACH · V · (CO₂ − outdoor) /
+  per-person output`) using the estimated air-changes/hour and the **room volume**
+  you set. Because that multiplies three uncertain inputs (estimated ACH, your
+  volume, and a per-person CO₂ output that varies ~2–3×), a single sensor can't pin
+  an exact number — so the card shows a band, with representative glyphs and a
+  *no camera* caption.
+- **Ventilation** — a **qualitative band** (poor / moderate / good / breezy) from
+  the air-changes/hour estimated off the CO₂ decay curve, with the approximate ACH
+  and time-to-clear shown as a caveated secondary line. ACH is only measurable
+  while the room is emptying, and is itself a rough fit — treat it as a relative
+  signal, not a precise figure.
 - **Comfort** — dew point and absolute humidity, with relative humidity shown on
   the shared 40–60% comfort band.
 - **Outside** — pressure tendency (rising / falling, hPa over 3h) and a one-line

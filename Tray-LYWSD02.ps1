@@ -1249,8 +1249,11 @@ function Rs-Delta($series, $prop, $cur, [double]$hours) {
 # falling back to a typical value), G = per-person CO2 output (~0.0186 m3/h at
 # rest), C_outdoor ~ 420 ppm. Room volume comes from the RoomVolume setting -
 # without it people and volume can't be separated from a single CO2 reading.
+# The raw count multiplies three uncertain inputs (estimated ACH, your room
+# volume, an assumed per-person CO2 output that varies ~2-3x), so we never claim
+# an exact integer - we report a qualitative band (empty / 1-2 / several / crowd).
 function Rs-Occupancy($a, $ach=$null) {
-    if (-not $a) { return @{ Count=$null; Activity='waiting for sensor'; Volume=$null } }
+    if (-not $a) { return @{ Band='waiting for sensor'; Level=$null; Night=$false; Volume=$null } }
     $co2 = [double]$a.Co2
     $cout = 420.0
     $s = Rs-Recent (Get-AranetSeries) 0.5; $slope = 0.0
@@ -1263,14 +1266,23 @@ function Rs-Occupancy($a, $ach=$null) {
     } else {
         $nSteady = ($ach * $V * ($co2 - $cout)) / $G          # plateau case
         $nRise   = ($slope * $V) / $G                          # freshly occupied, before ventilation catches up
-        $n = [int][Math]::Round([Math]::Max($nSteady, $nRise * 0.6))
-        if ($n -lt 1 -and $co2 -gt ($cout + 80)) { $n = 1 }
-        if ($n -gt 8) { $n = 8 }
+        $n = [Math]::Max($nSteady, $nRise * 0.6)
+        if ($n -lt 0.5 -and $co2 -gt ($cout + 80)) { $n = 1 }
     }
-    $h = (Get-Date).Hour; $act = 'one person'
-    if ($n -eq 0) { $act = 'empty' } elseif ($h -ge 23 -or $h -lt 6) { $act = 'asleep' }
-    elseif ($n -eq 1) { $act = 'one person' } elseif ($n -eq 2) { $act = 'two people' } else { $act = "$n people" }
-    return @{ Count=$n; Activity=$act; Volume=[int]$V }
+    if     ($n -lt 0.5) { $band = 'Empty';                          $lvl = 0 }
+    elseif ($n -lt 2.5) { $band = '1' + $script:RsNd + '2 people';  $lvl = 1 }
+    elseif ($n -lt 5.0) { $band = 'several people';                 $lvl = 2 }
+    else                { $band = 'a crowd';                        $lvl = 3 }
+    $h = (Get-Date).Hour
+    return @{ Band=$band; Level=$lvl; Night=($h -ge 23 -or $h -lt 6); Volume=[int]$V }
+}
+# Coarse ventilation band from the (uncertain) ACH estimate, home-appropriate.
+function Rs-AchBand($ach) {
+    if ($null -eq $ach)   { return @{ Band='estimating'; Level=-1 } }
+    if ($ach -lt 0.4)     { return @{ Band='Poor';     Level=0 } }
+    if ($ach -lt 1.2)     { return @{ Band='Moderate'; Level=1 } }
+    if ($ach -lt 4.0)     { return @{ Band='Good';     Level=2 } }
+    return @{ Band='Breezy'; Level=3 }
 }
 function Rs-ACH($a) {
     $s = Rs-Recent (Get-AranetSeries) 2.0; $cout = 420.0
@@ -1317,8 +1329,8 @@ function Rs-Verdict($co2, $temp, $rh, $occ) {
     }
     $state='good'; if ($airState -eq 'caution' -or $cState -eq 'caution') { $state='caution' }; if ($airState -eq 'alert') { $state='alert' }
     $op=''
-    if ($occ.Count -eq 0) { $op='Empty' } elseif ($occ.Count -eq 1) { $op='Likely one person' }
-    elseif ($occ.Count -eq 2) { $op='Likely two people' } elseif ($occ.Count -ge 3) { $op="About $($occ.Count) people" }
+    if ($occ.Level -eq 0) { $op='Empty' } elseif ($occ.Level -eq 1) { $op='Likely one or two people' }
+    elseif ($occ.Level -eq 2) { $op='Several people' } elseif ($occ.Level -eq 3) { $op='A crowd' }
     $line = "$airWord and $cWord."; if ($op) { $line += " $op." }
     return @{ Line=$line; State=$state }
 }
@@ -1463,34 +1475,46 @@ function Rs-PaintAirQuality($g, $p) {
 }
 function Rs-PaintOccupancy($g, $p) {
     $T = $script:DashTheme; Ensure-RsFonts; Rs-CardBg $g $p $T
-    if (-not $script:rs) { return }
+    if (-not $script:rs) { Rs-Skeleton $g $T 20 46 120 26; return }
     $pad = 20; $occ = $script:rs.Occ
     Rs-Txt $g 'Occupancy' $script:RsFonts.Title $T.TextP $pad ($pad-2)
-    $ctxt = if ($null -ne $occ.Count) { "$($occ.Count)" } else { $script:RsEm }
-    Rs-Txt $g $ctxt $script:RsFonts.Value $T.TextP $pad ($pad+24)
-    if ($null -ne $occ.Count) {
-        $n = [int]$occ.Count; $gx = $pad+40
-        for ($i=0; $i -lt [Math]::Max($n,1); $i++) { $col = if ($i -lt $n) { $T.TextS } else { $T.Hairline }; Rs-Person $g ($gx+$i*22) ($pad+28) 26 $col }
+    if ($null -eq $occ.Level) {
+        Rs-Txt $g 'waiting for sensor' $script:RsFonts.Body $T.TextT $pad ($pad+30)
+        return
     }
-    Rs-Txt $g $occ.Activity $script:RsFonts.Body $T.TextS $pad ($pad+64)
-    $cap = if ($null -ne $occ.Volume) { "inferred from CO$($script:RsSub2) $($script:RsMid) $($occ.Volume) m$($script:RsSup3) room $($script:RsMid) no camera" } else { 'inferred, no camera' }
+    # qualitative band as the headline (no exact integer is claimed)
+    Rs-Txt $g $occ.Band $script:RsFonts.Value $T.TextP $pad ($pad+24)
+    # a few representative person glyphs (faint, supportive of the band)
+    $ng = @(0, 2, 3, 4)[$occ.Level]
+    for ($i=0; $i -lt $ng; $i++) { Rs-Person $g ($pad+10+$i*22) ($pad+62) 24 $T.TextS }
+    if ($occ.Night -and $occ.Level -ge 1) { Rs-Txt $g 'probably asleep' $script:RsFonts.Body $T.TextS $pad ($pad+96) }
+    $cap = "inferred from CO$($script:RsSub2) $($script:RsMid) $($occ.Volume) m$($script:RsSup3) room $($script:RsMid) no camera"
     Rs-Txt $g $cap $script:RsFonts.Caption $T.TextT $pad ($p.Height-$pad-14)
 }
 function Rs-PaintVentilation($g, $p) {
     $T = $script:DashTheme; Ensure-RsFonts; Rs-CardBg $g $p $T
     if (-not $script:rs) { return }
-    $pad = 20; $ach = $script:rs.Ach
+    $pad = 20; $ach = $script:rs.Ach; $band = $script:rs.AchBand; $lvl = [int]$script:rs.AchLevel
     Rs-Txt $g 'Ventilation' $script:RsFonts.Title $T.TextP $pad ($pad-2)
-    if ($null -ne $ach) { $aw = Rs-Num $g (Rs-Fmt 'ach' '{0:0.0}') $script:RsFonts.Value $T.TextP $pad ($pad+24) }
-    else { $aw = Rs-Num $g $script:RsEm $script:RsFonts.Value $T.TextT $pad ($pad+24) }
-    Rs-Txt $g 'ACH' $script:RsFonts.Unit $T.TextT ($pad+$aw+4) ($pad+42)
-    $by = $pad+60; $bw = $p.Width-$pad*2
-    Rs-Fill $g $T.Sunken $pad $by $bw 6 3
-    Rs-Fill $g $T.AccentWash ([int]($pad+(4/10.0)*$bw)) $by ([int]((2/10.0)*$bw)) 6 3
-    if ($null -ne $ach) { $fw = ([double]$ach/10.0)*$bw; if ($fw -gt $bw) { $fw = $bw }; Rs-Fill $g $T.Accent $pad $by ([int]$fw) 6 3 }
-    $sub = if ($null -ne $script:rs.ClearMin -and $script:rs.ClearMin -gt 0) { "$($script:rs.ClearMin) min to baseline if vacated" } elseif ($null -ne $ach) { 'at baseline' } else { 'estimating from CO2 decay' }
-    Rs-Txt $g $sub $script:RsFonts.Body $T.TextS $pad ($by+16)
-    Rs-Txt $g ('target 4'+$script:RsNd+'6 air changes / hour') $script:RsFonts.Caption $T.TextT $pad ($p.Height-$pad-14)
+    $bcol = if ($lvl -lt 0) { $T.TextT } else { $T.TextP }
+    Rs-Txt $g $band $script:RsFonts.Value $bcol $pad ($pad+24)
+    if ($lvl -ge 0) {
+        $bw = (Rs-Meas $g $band $script:RsFonts.Value).Width
+        Rs-Txt $g 'airflow' $script:RsFonts.Unit $T.TextT ($pad+$bw+6) ($pad+42)
+    }
+    # 4-segment scale (poor -> breezy), filled up to the current band
+    $by = $pad+60; $tw = $p.Width-$pad*2; $seg = ($tw-3*6)/4.0
+    for ($i=0; $i -lt 4; $i++) {
+        $col = if ($lvl -ge 0 -and $i -le $lvl) { $T.Accent } else { $T.Sunken }
+        Rs-Fill $g $col ([int]($pad+$i*($seg+6))) $by ([int]$seg) 6 3
+    }
+    if ($null -ne $ach) {
+        $clr = if ($null -ne $script:rs.ClearMin -and $script:rs.ClearMin -gt 0) { "  $($script:RsMid)  ~$($script:rs.ClearMin) min to clear" } else { '' }
+        Rs-Txt $g ("$([char]0x2248)$('{0:0.0}' -f $ach) air changes/hour$clr") $script:RsFonts.Body $T.TextS $pad ($by+16)
+    } else {
+        Rs-Txt $g 'needs a CO2 decay (room emptying) to estimate' $script:RsFonts.Body $T.TextT $pad ($by+16)
+    }
+    Rs-Txt $g 'estimated from CO2 decay' $script:RsFonts.Caption $T.TextT $pad ($p.Height-$pad-14)
 }
 function Rs-PaintComfort($g, $p) {
     $T = $script:DashTheme; Ensure-RsFonts; Rs-CardBg $g $p $T
@@ -1656,7 +1680,7 @@ function Refresh-Dashboard {
     $aranetStale = ($null -ne $aranetAge -and $aranetAge -gt $aranetStaleMax)
     $clockAgeTxt  = if ($null -ne $clockAge)  { Rs-AgeText $clockAge }  else { '' }
     $aranetAgeTxt = if ($null -ne $aranetAge) { Rs-AgeText $aranetAge } else { '' }
-    $achR = Rs-ACH $a; $occ = Rs-Occupancy $a $achR.Ach; $pt = Rs-Pressure $a; $vd = Rs-Verdict $co2 $temp $hum $occ
+    $achR = Rs-ACH $a; $occ = Rs-Occupancy $a $achR.Ach; $achBand = Rs-AchBand $achR.Ach; $pt = Rs-Pressure $a; $vd = Rs-Verdict $co2 $temp $hum $occ
     $tD = [Math]::Round((Rs-Delta $sensor 'TempC' $temp 1.0),1)
     $hD = [Math]::Round((Rs-Delta $sensor 'Hum' $hum 1.0),0)
     $cD = [Math]::Round((Rs-Delta $aranet 'Co2' $co2 1.0),0)
@@ -1670,7 +1694,7 @@ function Refresh-Dashboard {
     Rs-SetTargets @{ co2=$co2; v_temp=$temp; v_hum=$hum; v_co2=$co2; v_pres=$pres; dew=$dew; ach=$achR.Ach }
     $script:rs = @{
         Temp=$temp; Hum=$hum; Co2=$co2; Pres=$pres; Dew=$dew; Abs=$abs
-        Occ=$occ; Ach=$achR.Ach; ClearMin=$achR.ClearMin; PresTrend=$pt.Trend; PresRate=$pt.Rate
+        Occ=$occ; Ach=$achR.Ach; ClearMin=$achR.ClearMin; AchBand=$achBand.Band; AchLevel=$achBand.Level; PresTrend=$pt.Trend; PresRate=$pt.Rate
         Verdict=$vd.Line; State=$vd.State; Rebreathed=$(if ($null -ne $co2) { Rs-Rebreathed $co2 } else { $null })
         Updated=$now; Timeline=$aranet
         Co2Stale=$aranetStale; Co2Age=$aranetAgeTxt; AnyStale=($clockStale -or $aranetStale)
