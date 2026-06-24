@@ -279,6 +279,10 @@ function New-TrendChart {
         $s.XValueType = [System.Windows.Forms.DataVisualization.Charting.ChartValueType]::DateTime
         $s.BorderWidth = if ($Compact) {2} else {3}; $s.Color = $color; $s.YAxisType = $axis; $s.LegendText = $legend
         $s.ToolTip = $tip
+        # small markers so isolated/sparse points stay visible even where the
+        # line breaks across a gap (a bare Line draws nothing for a lone point).
+        $s.MarkerStyle = [System.Windows.Forms.DataVisualization.Charting.MarkerStyle]::Circle
+        $s.MarkerSize = if ($Compact) {2} else {3}; $s.MarkerColor = $color
         if ($dash) { $s.BorderDashStyle = [System.Windows.Forms.DataVisualization.Charting.ChartDashStyle]::Dash }
         $chart.Series.Add($s)
     }
@@ -312,7 +316,7 @@ function Rebuild-ChartData {
     $data = @(Get-SensorSeries | Where-Object { $_.T -ge $b.From -and $_.T -le $b.To })
     $sT = $chart.Series['Temperature']; $sD = $chart.Series['Dew point']; $sH = $chart.Series['Humidity']
     $sT.Points.Clear(); $sD.Points.Clear(); $sH.Points.Clear()
-    $gap = [Math]::Max(3 * (Clock-Interval), 35)
+    $gap = [Math]::Max(4 * (Clock-Interval), 120)   # only break across real outages (~2h+)
     Add-GapAware $sH $data 'Hum'   $gap
     Add-GapAware $sT $data 'TempC' $gap
     Add-GapAware $sD $data 'Dew'   $gap
@@ -338,16 +342,16 @@ function New-Co2Chart {
     $chart.ChartAreas.Add($area)
     $P=[System.Windows.Forms.DataVisualization.Charting.AxisType]::Primary
     $S=[System.Windows.Forms.DataVisualization.Charting.AxisType]::Secondary
-    # CO2 = gradient area fill (hero), Pressure = line. Area/Line (not the Spline
-    # variants) so the curve never overshoots between unevenly-spaced samples.
+    # Both as Line (not Spline/Area): Line never overshoots and breaks cleanly at
+    # gaps, whereas an Area wedges down to the axis floor across a gap and leaves a
+    # misleading faint fill where there is no data.
     $sCo2 = New-Object System.Windows.Forms.DataVisualization.Charting.Series('CO2')
-    $sCo2.ChartType = [System.Windows.Forms.DataVisualization.Charting.SeriesChartType]::Area
+    $sCo2.ChartType = [System.Windows.Forms.DataVisualization.Charting.SeriesChartType]::Line
     $sCo2.XValueType = [System.Windows.Forms.DataVisualization.Charting.ChartValueType]::DateTime
     $sCo2.YAxisType = $P; $sCo2.LegendText = 'CO2 (ppm)'
-    $sCo2.Color = [System.Drawing.Color]::FromArgb(70, $cCo2)
-    $sCo2.BackGradientStyle = [System.Windows.Forms.DataVisualization.Charting.GradientStyle]::TopBottom
-    $sCo2.BackSecondaryColor = [System.Drawing.Color]::FromArgb(8, $cCo2)
-    $sCo2.BorderColor = $cCo2; $sCo2.BorderWidth = if ($Compact) {2} else {3}
+    $sCo2.Color = $cCo2; $sCo2.BorderWidth = if ($Compact) {2} else {3}
+    $sCo2.MarkerStyle = [System.Windows.Forms.DataVisualization.Charting.MarkerStyle]::Circle
+    $sCo2.MarkerSize = if ($Compact) {2} else {3}; $sCo2.MarkerColor = $cCo2
     $sCo2.ToolTip = "CO2  #VALY{0} ppm  @ #VALX"
     $chart.Series.Add($sCo2)
     $sPres = New-Object System.Windows.Forms.DataVisualization.Charting.Series('Pressure')
@@ -355,6 +359,8 @@ function New-Co2Chart {
     $sPres.XValueType = [System.Windows.Forms.DataVisualization.Charting.ChartValueType]::DateTime
     $sPres.YAxisType = $S; $sPres.LegendText = 'Pressure (hPa)'
     $sPres.Color = $cPres; $sPres.BorderWidth = if ($Compact) {2} else {3}
+    $sPres.MarkerStyle = [System.Windows.Forms.DataVisualization.Charting.MarkerStyle]::Circle
+    $sPres.MarkerSize = if ($Compact) {2} else {3}; $sPres.MarkerColor = $cPres
     $sPres.ToolTip = "Pressure  #VALY{0.0} hPa  @ #VALX"
     $chart.Series.Add($sPres)
     $lg = New-Object System.Windows.Forms.DataVisualization.Charting.Legend('L')
@@ -370,7 +376,7 @@ function Rebuild-Co2Data {
     $data = @(Get-AranetSeries | Where-Object { $_.T -ge $b.From -and $_.T -le $b.To })
     $sC = $chart.Series['CO2']; $sP = $chart.Series['Pressure']
     $sC.Points.Clear(); $sP.Points.Clear()
-    $gap = [Math]::Max(4 * (Aranet-Interval), 25)
+    $gap = [Math]::Max(8 * (Aranet-Interval), 120)  # only break across real outages (~2h+)
     Add-GapAware $sC $data 'Co2'  $gap
     Add-GapAware $sP $data 'Pres' $gap
     Update-Granularity $chart
