@@ -273,7 +273,9 @@ function New-TrendChart {
     $mk = {
         param($name,$legend,$axis,$color,$dash,$tip)
         $s = New-Object System.Windows.Forms.DataVisualization.Charting.Series($name)
-        $s.ChartType = [System.Windows.Forms.DataVisualization.Charting.SeriesChartType]::Spline
+        # Line, not Spline: spline interpolation overshoots between unevenly-spaced
+        # samples, inventing curves and spikes that aren't in the data.
+        $s.ChartType = [System.Windows.Forms.DataVisualization.Charting.SeriesChartType]::Line
         $s.XValueType = [System.Windows.Forms.DataVisualization.Charting.ChartValueType]::DateTime
         $s.BorderWidth = if ($Compact) {2} else {3}; $s.Color = $color; $s.YAxisType = $axis; $s.LegendText = $legend
         $s.ToolTip = $tip
@@ -290,17 +292,30 @@ function New-TrendChart {
     $chart.Legends.Add($lg)
     return $chart
 }
+# Add points to a series, inserting an empty point across gaps larger than
+# $gapMin so the line/area BREAKS instead of drawing a misleading connector
+# across hours/days when the widget wasn't logging.
+function Add-GapAware($series, $rows, [string]$vprop, [double]$gapMin) {
+    $prev = $null
+    foreach ($r in $rows) {
+        $t = $r.T
+        if ($null -ne $prev -and ($t - $prev).TotalMinutes -gt $gapMin) {
+            $i = $series.Points.AddXY($prev.AddSeconds(30), 0); $series.Points[$i].IsEmpty = $true
+        }
+        [void]$series.Points.AddXY($t, $r.$vprop)
+        $prev = $t
+    }
+}
 function Rebuild-ChartData {
     param($chart, [string]$TitleText)
     $b = Get-RangeBounds
     $data = @(Get-SensorSeries | Where-Object { $_.T -ge $b.From -and $_.T -le $b.To })
     $sT = $chart.Series['Temperature']; $sD = $chart.Series['Dew point']; $sH = $chart.Series['Humidity']
     $sT.Points.Clear(); $sD.Points.Clear(); $sH.Points.Clear()
-    foreach ($r in $data) {
-        [void]$sH.Points.AddXY($r.T, $r.Hum)
-        [void]$sT.Points.AddXY($r.T, $r.TempC)
-        [void]$sD.Points.AddXY($r.T, $r.Dew)
-    }
+    $gap = [Math]::Max(3 * (Clock-Interval), 35)
+    Add-GapAware $sH $data 'Hum'   $gap
+    Add-GapAware $sT $data 'TempC' $gap
+    Add-GapAware $sD $data 'Dew'   $gap
     Update-Granularity $chart
     if ($chart.Titles.Count -gt 0 -and $TitleText) { $chart.Titles[0].Text = $TitleText }
 }
@@ -323,9 +338,10 @@ function New-Co2Chart {
     $chart.ChartAreas.Add($area)
     $P=[System.Windows.Forms.DataVisualization.Charting.AxisType]::Primary
     $S=[System.Windows.Forms.DataVisualization.Charting.AxisType]::Secondary
-    # CO2 = gradient area fill (hero), Pressure = spline line.
+    # CO2 = gradient area fill (hero), Pressure = line. Area/Line (not the Spline
+    # variants) so the curve never overshoots between unevenly-spaced samples.
     $sCo2 = New-Object System.Windows.Forms.DataVisualization.Charting.Series('CO2')
-    $sCo2.ChartType = [System.Windows.Forms.DataVisualization.Charting.SeriesChartType]::SplineArea
+    $sCo2.ChartType = [System.Windows.Forms.DataVisualization.Charting.SeriesChartType]::Area
     $sCo2.XValueType = [System.Windows.Forms.DataVisualization.Charting.ChartValueType]::DateTime
     $sCo2.YAxisType = $P; $sCo2.LegendText = 'CO2 (ppm)'
     $sCo2.Color = [System.Drawing.Color]::FromArgb(70, $cCo2)
@@ -335,7 +351,7 @@ function New-Co2Chart {
     $sCo2.ToolTip = "CO2  #VALY{0} ppm  @ #VALX"
     $chart.Series.Add($sCo2)
     $sPres = New-Object System.Windows.Forms.DataVisualization.Charting.Series('Pressure')
-    $sPres.ChartType = [System.Windows.Forms.DataVisualization.Charting.SeriesChartType]::Spline
+    $sPres.ChartType = [System.Windows.Forms.DataVisualization.Charting.SeriesChartType]::Line
     $sPres.XValueType = [System.Windows.Forms.DataVisualization.Charting.ChartValueType]::DateTime
     $sPres.YAxisType = $S; $sPres.LegendText = 'Pressure (hPa)'
     $sPres.Color = $cPres; $sPres.BorderWidth = if ($Compact) {2} else {3}
@@ -354,10 +370,9 @@ function Rebuild-Co2Data {
     $data = @(Get-AranetSeries | Where-Object { $_.T -ge $b.From -and $_.T -le $b.To })
     $sC = $chart.Series['CO2']; $sP = $chart.Series['Pressure']
     $sC.Points.Clear(); $sP.Points.Clear()
-    foreach ($r in $data) {
-        [void]$sC.Points.AddXY($r.T, $r.Co2)
-        [void]$sP.Points.AddXY($r.T, $r.Pres)
-    }
+    $gap = [Math]::Max(4 * (Aranet-Interval), 25)
+    Add-GapAware $sC $data 'Co2'  $gap
+    Add-GapAware $sP $data 'Pres' $gap
     Update-Granularity $chart
     if ($chart.Titles.Count -gt 0 -and $TitleText) { $chart.Titles[0].Text = $TitleText }
 }
