@@ -128,10 +128,14 @@ dark are both first-class (toggle in the controls strip).
   an exact number — so the card shows a band, with representative glyphs and a
   *no camera* caption.
 - **Ventilation** — a **qualitative band** (poor / moderate / good / breezy) from
-  the air-changes/hour estimated off the CO₂ decay curve, with the approximate ACH
-  and time-to-clear shown as a caveated secondary line. ACH is only measurable
-  while the room is emptying, and is itself a rough fit — treat it as a relative
-  signal, not a precise figure.
+  the air-changes/hour. ACH is fitted by regressing `dC/dt` against `(CO₂ −
+  outdoor)` over a recent window: `ACH = −slope`. Because that uses the *rate of
+  change*, it works whether CO₂ is decaying (room emptying), building toward a
+  plateau (filling), or mixed — not only on a clean decay. Flat CO₂ has no spread
+  to fit, so the last good value is **remembered** (and the card says how long
+  ago it was measured) rather than going blank; a new fit that diverges from it
+  flags **"ventilation just changed"**. The approximate ACH and time-to-clear sit
+  on a caveated secondary line — a relative signal, not a precise figure.
 - **Comfort** — dew point and absolute humidity, with relative humidity shown on
   the shared 40–60% comfort band.
 - **Outside** — pressure tendency (rising / falling, hPa over 3h) and a one-line

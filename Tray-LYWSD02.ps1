@@ -1305,25 +1305,61 @@ function Rs-AchBand($ach) {
     if ($ach -lt 4.0)     { return @{ Band='Good';     Level=2 } }
     return @{ Band='Breezy'; Level=3 }
 }
+# Air changes/hour from the CO2 mass balance, generalised:
+#   dC/dt = G' - ACH*(C - C_out)
+# A least-squares line of dC/dt against (C - C_out) over a recent window gives
+# ACH = -slope (and the generation term G' = intercept) - so we measure airflow
+# from ANY varying CO2 (decaying, building toward a plateau, or mixed), not only
+# from a room emptying. Flat CO2 has no spread to fit (under-determined), so we
+# persist the last good value and keep showing it. A new fit that diverges from
+# the persisted one means ventilation changed (a window opened/closed).
 function Rs-ACH($a) {
-    $s = Rs-Recent (Get-AranetSeries) 2.0; $cout = 420.0
-    if ($s.Count -lt 4) { return @{ Ach=$null; ClearMin=$null } }
-    $best = $null
-    for ($i=0; $i -lt $s.Count-3; $i++) {
-        $c0 = [double]$s[$i].Co2; if ($c0 -le $cout+40) { continue }
-        for ($j=$i+2; $j -lt $s.Count; $j++) {
-            $ct = [double]$s[$j].Co2
-            if ($ct -lt $c0-25 -and $ct -gt $cout+5) {
-                $dt = ($s[$j].T - $s[$i].T).TotalHours
-                if ($dt -gt 0.25) { $ach = [Math]::Log(($c0-$cout)/($ct-$cout))/$dt; if ($ach -gt 0) { $best = $ach } }
+    $cout = 420.0
+    $s = Rs-Recent (Get-AranetSeries) 2.0
+    $measured = $null
+    if ($s.Count -ge 6) {
+        # light 3-point smoothing to blunt sensor noise before differencing
+        $c = New-Object 'System.Collections.Generic.List[double]'
+        for ($i=0; $i -lt $s.Count; $i++) {
+            $lo=[Math]::Max(0,$i-1); $hi=[Math]::Min($s.Count-1,$i+1); $sum=0.0; $cnt=0
+            for ($j=$lo; $j -le $hi; $j++) { $sum += [double]$s[$j].Co2; $cnt++ }
+            $c.Add($sum/$cnt)
+        }
+        $xs=New-Object 'System.Collections.Generic.List[double]'; $ys=New-Object 'System.Collections.Generic.List[double]'
+        for ($i=0; $i -lt $s.Count-1; $i++) {
+            $dtH = ($s[$i+1].T - $s[$i].T).TotalHours
+            if ($dtH -lt 0.04 -or $dtH -gt 0.34) { continue }   # skip dup samples and data gaps
+            $xs.Add(((($c[$i]+$c[$i+1])/2.0) - $cout)); $ys.Add((($c[$i+1]-$c[$i])/$dtH))
+        }
+        $nn = $xs.Count
+        if ($nn -ge 5) {
+            $xmin=($xs|Measure-Object -Minimum).Minimum; $xmax=($xs|Measure-Object -Maximum).Maximum
+            if (($xmax-$xmin) -ge 70) {   # need CO2 to vary to separate ACH from generation
+                $mx=($xs|Measure-Object -Average).Average; $my=($ys|Measure-Object -Average).Average
+                $sxx=0.0; $sxy=0.0
+                for ($k=0;$k -lt $nn;$k++){ $dx=$xs[$k]-$mx; $sxx+=$dx*$dx; $sxy+=$dx*($ys[$k]-$my) }
+                if ($sxx -gt 0) {
+                    $b=$sxy/$sxx; $aint=$my-$b*$mx; $sse=0.0; $sst=0.0
+                    for ($k=0;$k -lt $nn;$k++){ $p=$aint+$b*$xs[$k]; $sse+=[Math]::Pow($ys[$k]-$p,2); $sst+=[Math]::Pow($ys[$k]-$my,2) }
+                    $r2 = if ($sst -gt 0) { 1-$sse/$sst } else { 0 }
+                    $ach = -$b
+                    if ($ach -gt 0.1 -and $ach -lt 15 -and $r2 -ge 0.45) { $measured = $ach }
+                }
             }
         }
     }
-    if ($null -eq $best) { return @{ Ach=$null; ClearMin=$null } }
-    if ($best -lt 0.2) { $best = 0.2 }; if ($best -gt 12) { $best = 12 }
+    if ($null -ne $measured) {
+        $m = [Math]::Max(0.1, [Math]::Min(15, $measured))
+        if ($null -ne $script:rsLastAch -and ([Math]::Abs($m-$script:rsLastAch)/[Math]::Max(0.4,$script:rsLastAch)) -gt 0.6) { $script:rsAchChangedAt = (Get-Date) }
+        $script:rsLastAch = $m; $script:rsLastAchAt = (Get-Date)
+    }
+    $ach = $script:rsLastAch
+    if ($null -ne $script:rsLastAchAt -and ((Get-Date)-$script:rsLastAchAt).TotalHours -gt 6) { $ach = $null }   # too old to trust
+    $changed = ($null -ne $script:rsAchChangedAt -and ((Get-Date)-$script:rsAchChangedAt).TotalMinutes -le 20)
+    $ageMin = if ($null -ne $script:rsLastAchAt) { ((Get-Date)-$script:rsLastAchAt).TotalMinutes } else { $null }
     $clear = 0
-    if ($a) { $cnow = [double]$a.Co2; if ($cnow -gt $cout+50) { $clear = [int]([Math]::Log(($cnow-$cout)/50.0)/$best*60) } }
-    return @{ Ach=[Math]::Round($best,1); ClearMin=$clear }
+    if ($a -and $null -ne $ach) { $cnow=[double]$a.Co2; if ($cnow -gt $cout+50) { $clear = [int]([Math]::Log(($cnow-$cout)/50.0)/$ach*60) } }
+    return @{ Ach=$(if ($null -ne $ach) { [Math]::Round($ach,1) } else { $null }); ClearMin=$clear; Fresh=($null -ne $measured); Changed=$changed; AgeMin=$ageMin }
 }
 function Rs-Pressure($a) {
     if (-not $a) { return @{ Trend='steady'; Rate=0 } }
@@ -1390,6 +1426,7 @@ function Rs-Skeleton($g, $T, [int]$x, [int]$y, [int]$w, [int]$h) {
 # tween state: target values + currently-displayed (eased) values
 $script:rsDisp = @{}; $script:rsTarget = @{}
 $script:rsVAlpha = 1.0; $script:rsPrevVerdict = ''; $script:rsSettle = @{}
+$script:rsLastAch = $null; $script:rsLastAchAt = $null; $script:rsAchChangedAt = $null   # persisted ventilation estimate
 function Rs-SetTargets($map) {
     $reduced = Rs-ReducedMotion
     foreach ($k in @($map.Keys)) {
@@ -1530,12 +1567,21 @@ function Rs-PaintVentilation($g, $p) {
         Rs-Fill $g $col ([int]($pad+$i*($seg+6))) $by ([int]$seg) 6 3
     }
     if ($null -ne $ach) {
-        $clr = if ($null -ne $script:rs.ClearMin -and $script:rs.ClearMin -gt 0) { "  $($script:RsMid)  ~$($script:rs.ClearMin) min to clear" } else { '' }
-        Rs-Txt $g ("$([char]0x2248)$('{0:0.0}' -f $ach) air changes/hour$clr") $script:RsFonts.Body $T.TextS $pad ($by+16)
+        # fresh fit -> show time-to-clear; remembered value -> show its age, honestly
+        if ($script:rs.AchFresh) {
+            $clr = if ($null -ne $script:rs.ClearMin -and $script:rs.ClearMin -gt 0) { "  $($script:RsMid)  ~$($script:rs.ClearMin) min to clear" } else { '' }
+            $sec = "$([char]0x2248)$('{0:0.0}' -f $ach) air changes/hour$clr"
+        } else {
+            $ageTxt = if ($null -ne $script:rs.AchAge) { Rs-AgeText ([double]$script:rs.AchAge) } else { 'earlier' }
+            $sec = "$([char]0x2248)$('{0:0.0}' -f $ach) ACH  $($script:RsMid)  measured $ageTxt"
+        }
+        Rs-Txt $g $sec $script:RsFonts.Body $T.TextS $pad ($by+16)
     } else {
-        Rs-Txt $g 'needs a CO2 decay (room emptying) to estimate' $script:RsFonts.Body $T.TextT $pad ($by+16)
+        Rs-Txt $g 'needs CO2 to vary (in or out) to estimate' $script:RsFonts.Body $T.TextT $pad ($by+16)
     }
-    Rs-Txt $g 'estimated from CO2 decay' $script:RsFonts.Caption $T.TextT $pad ($p.Height-$pad-14)
+    $cap = 'estimated from CO2 dynamics'; $ccol = $T.TextT
+    if ($script:rs.AchChanged) { $cap = 'ventilation just changed'; $ccol = $T.Caution }
+    Rs-Txt $g $cap $script:RsFonts.Caption $ccol $pad ($p.Height-$pad-14)
 }
 function Rs-PaintComfort($g, $p) {
     $T = $script:DashTheme; Ensure-RsFonts; Rs-CardBg $g $p $T
@@ -1715,7 +1761,8 @@ function Refresh-Dashboard {
     Rs-SetTargets @{ co2=$co2; v_temp=$temp; v_hum=$hum; v_co2=$co2; v_pres=$pres; dew=$dew; ach=$achR.Ach }
     $script:rs = @{
         Temp=$temp; Hum=$hum; Co2=$co2; Pres=$pres; Dew=$dew; Abs=$abs
-        Occ=$occ; Ach=$achR.Ach; ClearMin=$achR.ClearMin; AchBand=$achBand.Band; AchLevel=$achBand.Level; PresTrend=$pt.Trend; PresRate=$pt.Rate
+        Occ=$occ; Ach=$achR.Ach; ClearMin=$achR.ClearMin; AchBand=$achBand.Band; AchLevel=$achBand.Level
+        AchFresh=$achR.Fresh; AchChanged=$achR.Changed; AchAge=$achR.AgeMin; PresTrend=$pt.Trend; PresRate=$pt.Rate
         Verdict=$vd.Line; State=$vd.State; Rebreathed=$(if ($null -ne $co2) { Rs-Rebreathed $co2 } else { $null })
         Updated=$now; Timeline=$aranet
         Co2Stale=$aranetStale; Co2Age=$aranetAgeTxt; AnyStale=($clockStale -or $aranetStale)
