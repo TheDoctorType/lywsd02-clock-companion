@@ -1367,18 +1367,16 @@ function Load-Ach {
         if ($j.ach -and $j.at) { $when = [datetime]$j.at; if (((Get-Date)-$when).TotalHours -lt 6) { $script:rsLastAch = [double]$j.ach; $script:rsLastAchAt = $when } }
     } catch {}
 }
-# Log-linear fit y = a + slope*t (used for decay with the asymptote fixed); ACH = -slope.
-function Rs-LogFit($xs, $ys, [double]$minR2) {
-    $n = $xs.Count; if ($n -lt 5) { return $null }
+# Ordinary least-squares line y = a + slope*t; returns slope and R^2.
+function Rs-LinFit($xs, $ys) {
+    $n = $xs.Count; if ($n -lt 4) { return $null }
     $mx=($xs|Measure-Object -Average).Average; $my=($ys|Measure-Object -Average).Average
     $sxx=0.0; $sxy=0.0; $syy=0.0
     for ($i=0;$i -lt $n;$i++){ $dx=$xs[$i]-$mx; $sxx+=$dx*$dx; $sxy+=$dx*($ys[$i]-$my); $syy+=[Math]::Pow($ys[$i]-$my,2) }
     if ($sxx -le 0 -or $syy -le 0) { return $null }
     $slope=$sxy/$sxx; $sse=0.0
     for ($i=0;$i -lt $n;$i++){ $p=$my+$slope*($xs[$i]-$mx); $sse+=[Math]::Pow($ys[$i]-$p,2) }
-    $r2=1-$sse/$syy; $ach=-$slope
-    if ($ach -ge 0.1 -and $ach -le 15 -and $r2 -ge $minR2) { return $ach }
-    return $null
+    return @{ Slope=$slope; R2=(1-$sse/$syy) }
 }
 # Exponential grid-fit C = Css + A*exp(-ach*t) for a buildup toward an unknown
 # plateau: 1-D search over ACH with a linear Css/A sub-fit (no differentiation, so
@@ -1404,30 +1402,42 @@ function Rs-GridFit($c, $tt, [double]$lastC) {
 }
 function Rs-ACH($a) {
     $cout = 420.0
-    $s = Rs-Recent (Get-AranetSeries) 2.5
+    $s = Rs-Recent (Get-AranetSeries) 3.0
     $measured = $null
     if ($s.Count -ge 6) {
+        $n = $s.Count
         # 3-point smoothing to blunt sensor noise
         $c = New-Object 'System.Collections.Generic.List[double]'
-        for ($i=0; $i -lt $s.Count; $i++) {
-            $lo=[Math]::Max(0,$i-1); $hi=[Math]::Min($s.Count-1,$i+1); $sum=0.0; $cnt=0
+        for ($i=0; $i -lt $n; $i++) {
+            $lo=[Math]::Max(0,$i-1); $hi=[Math]::Min($n-1,$i+1); $sum=0.0; $cnt=0
             for ($j=$lo; $j -le $hi; $j++) { $sum += [double]$s[$j].Co2; $cnt++ }
             $c.Add($sum/$cnt)
         }
-        $t0 = $s[0].T; $spanH = ($s[$s.Count-1].T - $t0).TotalHours
-        $cmin=($c|Measure-Object -Minimum).Minimum; $cmax=($c|Measure-Object -Maximum).Maximum
-        if ($spanH -ge 0.4 -and ($cmax-$cmin) -ge 60) {
-            $trend = $c[$c.Count-1] - $c[0]
-            if ($trend -lt -25) {
-                # DECAY (room clearing): asymptote is the outdoor baseline -> log-linear fit
-                $xs=New-Object 'System.Collections.Generic.List[double]'; $ys=New-Object 'System.Collections.Generic.List[double]'
-                for ($i=0;$i -lt $s.Count;$i++){ if ($c[$i] -gt $cout+25) { $xs.Add((($s[$i].T-$t0).TotalHours)); $ys.Add([Math]::Log($c[$i]-$cout)) } }
-                $measured = Rs-LogFit $xs $ys 0.6
-            } elseif ($trend -gt 25) {
-                # BUILDUP toward a plateau: constrained exponential grid-fit
-                $tt=New-Object 'System.Collections.Generic.List[double]'; for ($i=0;$i -lt $s.Count;$i++){ $tt.Add((($s[$i].T-$t0).TotalHours)) }
-                $measured = Rs-GridFit $c $tt $c[$c.Count-1]
-            }
+        $t0=$s[0].T; $tt=New-Object 'System.Collections.Generic.List[double]'; for ($i=0;$i -lt $n;$i++){ $tt.Add((($s[$i].T-$t0).TotalHours)) }
+        # Real occupancy is messy (CO2 rises and falls), so don't require the whole
+        # window to trend one way. Scan for the cleanest DECAY segment (a peak down
+        # to a later trough) and fit ln(C-420) vs t over it (asymptote = outdoor).
+        $bestScore = 0.0
+        for ($i=0; $i -lt $n-3; $i++) {
+            if ($c[$i] -le $cout+60) { continue }
+            $jmin=-1; $cmin=[double]::MaxValue
+            for ($j=$i+1; $j -lt $n; $j++) { if ($c[$j] -lt $cmin) { $cmin=$c[$j]; $jmin=$j } }
+            if ($jmin -lt 0 -or ($c[$i]-$cmin) -lt 40) { continue }
+            $dur = $tt[$jmin]-$tt[$i]; if ($dur -lt 0.33) { continue }   # >= 20 min
+            $xs=New-Object 'System.Collections.Generic.List[double]'; $ys=New-Object 'System.Collections.Generic.List[double]'
+            for ($k=$i; $k -le $jmin; $k++) { if ($c[$k] -gt $cout+15) { $xs.Add($tt[$k]); $ys.Add([Math]::Log($c[$k]-$cout)) } }
+            if ($xs.Count -lt 4) { continue }
+            $fit = Rs-LinFit $xs $ys
+            if ($null -eq $fit) { continue }
+            $ach = -$fit.Slope
+            if ($ach -lt 0.15 -or $ach -gt 12 -or $fit.R2 -lt 0.6) { continue }
+            $score = $dur * $fit.R2
+            if ($score -gt $bestScore) { $bestScore = $score; $measured = $ach }
+        }
+        # fallback: a clean buildup toward a plateau (constrained exponential grid-fit)
+        if ($null -eq $measured) {
+            $cmn=($c|Measure-Object -Minimum).Minimum; $cmx=($c|Measure-Object -Maximum).Maximum
+            if (($cmx-$cmn) -ge 60 -and ($c[$n-1]-$c[0]) -gt 40) { $measured = Rs-GridFit $c $tt $c[$n-1] }
         }
     }
     if ($null -ne $measured) {
