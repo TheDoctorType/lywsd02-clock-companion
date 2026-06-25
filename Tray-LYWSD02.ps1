@@ -28,6 +28,7 @@ $LogDir     = Join-Path $ScriptDir 'logs'
 $CsvPath    = Join-Path $LogDir 'sensors.csv'        # LYWSD02 history
 $AranetCsv  = Join-Path $LogDir 'aranet4.csv'        # Aranet4 history
 $LatestJson = Join-Path $LogDir 'aranet-latest.json' # latest Aranet reading (written by the watcher)
+$AchFile    = Join-Path $LogDir 'ach.json'           # last good ventilation estimate (survives restarts)
 $WidgetLog  = Join-Path $LogDir 'widget.log'
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Force -Path $LogDir | Out-Null }
 
@@ -1358,45 +1359,81 @@ function Rs-AchBand($ach) {
 # from a room emptying. Flat CO2 has no spread to fit (under-determined), so we
 # persist the last good value and keep showing it. A new fit that diverges from
 # the persisted one means ventilation changed (a window opened/closed).
+function Save-Ach { try { (@{ ach=$script:rsLastAch; at=$script:rsLastAchAt.ToString('s') } | ConvertTo-Json) | Set-Content -Path $AchFile -Encoding UTF8 } catch {} }
+function Load-Ach {
+    if (-not (Test-Path $AchFile)) { return }
+    try {
+        $j = Get-Content $AchFile -Raw | ConvertFrom-Json
+        if ($j.ach -and $j.at) { $when = [datetime]$j.at; if (((Get-Date)-$when).TotalHours -lt 6) { $script:rsLastAch = [double]$j.ach; $script:rsLastAchAt = $when } }
+    } catch {}
+}
+# Log-linear fit y = a + slope*t (used for decay with the asymptote fixed); ACH = -slope.
+function Rs-LogFit($xs, $ys, [double]$minR2) {
+    $n = $xs.Count; if ($n -lt 5) { return $null }
+    $mx=($xs|Measure-Object -Average).Average; $my=($ys|Measure-Object -Average).Average
+    $sxx=0.0; $sxy=0.0; $syy=0.0
+    for ($i=0;$i -lt $n;$i++){ $dx=$xs[$i]-$mx; $sxx+=$dx*$dx; $sxy+=$dx*($ys[$i]-$my); $syy+=[Math]::Pow($ys[$i]-$my,2) }
+    if ($sxx -le 0 -or $syy -le 0) { return $null }
+    $slope=$sxy/$sxx; $sse=0.0
+    for ($i=0;$i -lt $n;$i++){ $p=$my+$slope*($xs[$i]-$mx); $sse+=[Math]::Pow($ys[$i]-$p,2) }
+    $r2=1-$sse/$syy; $ach=-$slope
+    if ($ach -ge 0.1 -and $ach -le 15 -and $r2 -ge $minR2) { return $ach }
+    return $null
+}
+# Exponential grid-fit C = Css + A*exp(-ach*t) for a buildup toward an unknown
+# plateau: 1-D search over ACH with a linear Css/A sub-fit (no differentiation, so
+# robust to noise). Rejects boundary / implausible-plateau (under-determined) fits.
+function Rs-GridFit($c, $tt, [double]$lastC) {
+    $n=$c.Count; $my=($c|Measure-Object -Average).Average; $sst=0.0; foreach($v in $c){$sst+=[Math]::Pow($v-$my,2)}
+    if ($sst -le 0) { return $null }
+    $best=$null; $bestErr=[double]::MaxValue; $bestCss=0.0
+    for ($A=0.2; $A -le 10; $A+=0.1) {
+        $u=New-Object 'System.Collections.Generic.List[double]'; $mu=0.0
+        for ($i=0;$i -lt $n;$i++){ $uu=[Math]::Exp(-$A*$tt[$i]); $u.Add($uu); $mu+=$uu }; $mu/=$n
+        $suu=0.0;$suc=0.0; for ($i=0;$i -lt $n;$i++){ $du=$u[$i]-$mu; $suu+=$du*$du; $suc+=$du*($c[$i]-$my) }
+        if ($suu -le 0) { continue }
+        $b=$suc/$suu; $aint=$my-$b*$mu; $err=0.0
+        for ($i=0;$i -lt $n;$i++){ $p=$aint+$b*$u[$i]; $err+=[Math]::Pow($c[$i]-$p,2) }
+        if ($err -lt $bestErr) { $bestErr=$err; $best=$A; $bestCss=$aint }
+    }
+    if ($null -eq $best) { return $null }
+    if ($best -le 0.25 -or $best -ge 9.85) { return $null }              # boundary -> can't pin
+    if ($bestCss -lt ($lastC+20) -or $bestCss -gt 4000) { return $null } # implausible plateau
+    if ((1 - $bestErr/$sst) -lt 0.85) { return $null }
+    return $best
+}
 function Rs-ACH($a) {
     $cout = 420.0
-    $s = Rs-Recent (Get-AranetSeries) 2.0
+    $s = Rs-Recent (Get-AranetSeries) 2.5
     $measured = $null
     if ($s.Count -ge 6) {
-        # light 3-point smoothing to blunt sensor noise before differencing
+        # 3-point smoothing to blunt sensor noise
         $c = New-Object 'System.Collections.Generic.List[double]'
         for ($i=0; $i -lt $s.Count; $i++) {
             $lo=[Math]::Max(0,$i-1); $hi=[Math]::Min($s.Count-1,$i+1); $sum=0.0; $cnt=0
             for ($j=$lo; $j -le $hi; $j++) { $sum += [double]$s[$j].Co2; $cnt++ }
             $c.Add($sum/$cnt)
         }
-        $xs=New-Object 'System.Collections.Generic.List[double]'; $ys=New-Object 'System.Collections.Generic.List[double]'
-        for ($i=0; $i -lt $s.Count-1; $i++) {
-            $dtH = ($s[$i+1].T - $s[$i].T).TotalHours
-            if ($dtH -lt 0.04 -or $dtH -gt 0.34) { continue }   # skip dup samples and data gaps
-            $xs.Add(((($c[$i]+$c[$i+1])/2.0) - $cout)); $ys.Add((($c[$i+1]-$c[$i])/$dtH))
-        }
-        $nn = $xs.Count
-        if ($nn -ge 5) {
-            $xmin=($xs|Measure-Object -Minimum).Minimum; $xmax=($xs|Measure-Object -Maximum).Maximum
-            if (($xmax-$xmin) -ge 70) {   # need CO2 to vary to separate ACH from generation
-                $mx=($xs|Measure-Object -Average).Average; $my=($ys|Measure-Object -Average).Average
-                $sxx=0.0; $sxy=0.0
-                for ($k=0;$k -lt $nn;$k++){ $dx=$xs[$k]-$mx; $sxx+=$dx*$dx; $sxy+=$dx*($ys[$k]-$my) }
-                if ($sxx -gt 0) {
-                    $b=$sxy/$sxx; $aint=$my-$b*$mx; $sse=0.0; $sst=0.0
-                    for ($k=0;$k -lt $nn;$k++){ $p=$aint+$b*$xs[$k]; $sse+=[Math]::Pow($ys[$k]-$p,2); $sst+=[Math]::Pow($ys[$k]-$my,2) }
-                    $r2 = if ($sst -gt 0) { 1-$sse/$sst } else { 0 }
-                    $ach = -$b
-                    if ($ach -gt 0.1 -and $ach -lt 15 -and $r2 -ge 0.45) { $measured = $ach }
-                }
+        $t0 = $s[0].T; $spanH = ($s[$s.Count-1].T - $t0).TotalHours
+        $cmin=($c|Measure-Object -Minimum).Minimum; $cmax=($c|Measure-Object -Maximum).Maximum
+        if ($spanH -ge 0.4 -and ($cmax-$cmin) -ge 60) {
+            $trend = $c[$c.Count-1] - $c[0]
+            if ($trend -lt -25) {
+                # DECAY (room clearing): asymptote is the outdoor baseline -> log-linear fit
+                $xs=New-Object 'System.Collections.Generic.List[double]'; $ys=New-Object 'System.Collections.Generic.List[double]'
+                for ($i=0;$i -lt $s.Count;$i++){ if ($c[$i] -gt $cout+25) { $xs.Add((($s[$i].T-$t0).TotalHours)); $ys.Add([Math]::Log($c[$i]-$cout)) } }
+                $measured = Rs-LogFit $xs $ys 0.6
+            } elseif ($trend -gt 25) {
+                # BUILDUP toward a plateau: constrained exponential grid-fit
+                $tt=New-Object 'System.Collections.Generic.List[double]'; for ($i=0;$i -lt $s.Count;$i++){ $tt.Add((($s[$i].T-$t0).TotalHours)) }
+                $measured = Rs-GridFit $c $tt $c[$c.Count-1]
             }
         }
     }
     if ($null -ne $measured) {
         $m = [Math]::Max(0.1, [Math]::Min(15, $measured))
         if ($null -ne $script:rsLastAch -and ([Math]::Abs($m-$script:rsLastAch)/[Math]::Max(0.4,$script:rsLastAch)) -gt 0.6) { $script:rsAchChangedAt = (Get-Date) }
-        $script:rsLastAch = $m; $script:rsLastAchAt = (Get-Date)
+        $script:rsLastAch = $m; $script:rsLastAchAt = (Get-Date); Save-Ach
     }
     $ach = $script:rsLastAch
     if ($null -ne $script:rsLastAchAt -and ((Get-Date)-$script:rsLastAchAt).TotalHours -gt 6) { $ach = $null }   # too old to trust
@@ -1614,7 +1651,9 @@ function Rs-PaintVentilation($g, $p) {
     if ($null -ne $ach) {
         # fresh fit -> show time-to-clear; remembered value -> show its age, honestly
         if ($script:rs.AchFresh) {
-            $clr = if ($null -ne $script:rs.ClearMin -and $script:rs.ClearMin -gt 0) { "  $($script:RsMid)  ~$($script:rs.ClearMin) min to clear" } else { '' }
+            $cm = [int]$script:rs.ClearMin
+            $clrTxt = if ($cm -gt 360) { 'slow to clear' } elseif ($cm -gt 120) { '~{0:0.0}h to clear' -f ($cm/60.0) } else { "~$cm min to clear" }
+            $clr = if ($cm -gt 0) { "  $($script:RsMid)  $clrTxt" } else { '' }
             $sec = "$([char]0x2248)$('{0:0.0}' -f $ach) air changes/hour$clr"
         } else {
             $ageTxt = if ($null -ne $script:rs.AchAge) { Rs-AgeText ([double]$script:rs.AchAge) } else { 'earlier' }
@@ -1744,15 +1783,15 @@ function Rs-Toast($title, $msg, $kind) {
         Ensure-RsFonts
         $t = $script:dash.Toast; $f = $script:dash.Form
         $t.Tag = @{ Title=[string]$title; Msg=[string]$msg; Kind=[string]$kind }
+        # sit in the empty right side of the controls strip (the bottom row), wrapped
+        $wide = 326; $wmax = $f.ClientSize.Width - 56; if ($wide -gt $wmax) { $wide = $wmax }
         $gg = $t.CreateGraphics()
-        $mw = [int]($gg.MeasureString([string]$msg, $script:RsFonts.Body).Width)
-        $tw = [int]($gg.MeasureString([string]$title, $script:RsFonts.Caption).Width)
+        $ms = $gg.MeasureString([string]$msg, $script:RsFonts.Body, ($wide-46))
         $gg.Dispose()
-        $wide = ([Math]::Max($mw,$tw)) + 56
-        $wmax = $f.ClientSize.Width - 80; if ($wide -gt $wmax) { $wide = $wmax }; if ($wide -lt 200) { $wide = 200 }
-        $th = 52
+        $th = [int]([Math]::Max(46, $ms.Height + 28))
+        $stripTop = $f.ClientSize.Height - 176                         # controls strip (150) + footer (26)
         $t.Size = New-Object System.Drawing.Size([int]$wide, $th)
-        $t.Location = New-Object System.Drawing.Point([int](($f.ClientSize.Width-$wide)/2), [int]($f.ClientSize.Height - 176 - $th - 14))
+        $t.Location = New-Object System.Drawing.Point([int]($f.ClientSize.Width-$wide-26), [int]($stripTop + (150-$th)/2))
         $t.Visible = $true; $t.BringToFront(); $t.Invalidate()
         if ($script:dash.ToastTimer) { $script:dash.ToastTimer.Stop(); $script:dash.ToastTimer.Start() }
     } elseif ($script:ni) {
@@ -1768,9 +1807,11 @@ function Rs-PaintToast($g, $p) {
     Rs-Stroke $g $T.Hairline 0 0 ($w-1) ($h-1) 12
     if (-not $d) { return }
     $acc = if ($d.Kind -eq 'warn') { $T.Caution } else { $T.Accent }
-    $db = New-Object Drawing.SolidBrush $acc; $g.FillEllipse($db, [single]18, [single](($h/2)-4), [single]8, [single]8); $db.Dispose()
-    if ($d.Title) { Rs-Txt $g $d.Title $script:RsFonts.Caption $acc 36 9 }
-    Rs-Txt $g $d.Msg $script:RsFonts.Body $T.TextP 36 ($(if ($d.Title) {25} else {18}))
+    $db = New-Object Drawing.SolidBrush $acc; $g.FillEllipse($db, [single]18, [single]15, [single]8, [single]8); $db.Dispose()
+    $my = 11
+    if ($d.Title) { Rs-Txt $g $d.Title $script:RsFonts.Caption $acc 36 $my; $my = 26 }
+    $mb = New-Object Drawing.SolidBrush $T.TextP
+    $g.DrawString([string]$d.Msg, $script:RsFonts.Body, $mb, (New-Object Drawing.RectangleF(36, $my, ($w-46), ($h-$my-4)))); $mb.Dispose()
 }
 
 # Hover popup: compact Room State summary (verdict + 4 readings + CO2 sparkline).
@@ -2142,6 +2183,7 @@ Refresh-Menu
 # Honour the saved light/dark theme so the hover popup matches before the
 # dashboard is first opened.
 try { Apply-Theme $(if ($script:settings.Theme) { [string]$script:settings.Theme } else { 'dark' }) } catch {}
+try { Load-Ach } catch {}   # restore the last ventilation estimate so it survives restarts
 WLog "Widget started (addr='$($script:settings.Address)', interval=$($script:settings.IntervalMinutes)m, conn=$($script:settings.ConnectionEnabled))."
 
 # ---- Run ------------------------------------------------------------------
