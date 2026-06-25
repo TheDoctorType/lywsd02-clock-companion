@@ -146,7 +146,12 @@ dark are both first-class (toggle in the controls strip).
 - **Controls** (slim strip) — toggles for connection, Aranet tracking, CSV logging,
   start-at-login and **light/dark theme**; per-device read-interval selectors; a
   **room volume (m³)** setting that feeds the occupancy estimate; and buttons to
-  sync the clock, read a device now, or open the data folder.
+  sync the clock, read a device now, or open the data folder. **Read clock** does a
+  live BLE read (temperature/humidity move slowly, so a fresh read often shows the
+  same value — the footer's "last read" time confirms it happened). **Read Aranet4**
+  shows the latest broadcast if it's recent, otherwise waits for the next one — the
+  Aranet only measures ~once a minute and can't be commanded, so that's as fresh as
+  it gets. The footer shows each device's last-read time.
 
 Everything you change is saved and mirrored in the tray menu. The occupancy,
 ventilation and outdoor figures are **inferences** from the five inputs

@@ -510,8 +510,8 @@ $script:jobs = New-Object System.Collections.ArrayList
 
 function Start-Bg {
     param([ValidateSet('read','sync')] [string]$Kind, [bool]$LogCsv, [bool]$Notify)
-    if (-not $script:settings.ConnectionEnabled) { return }
-    if (Job-Active 'clock') { return }
+    if (-not $script:settings.ConnectionEnabled) { if ($Notify) { try { $script:ni.ShowBalloonTip(4000,'LYWSD02','Connection is off (battery saver). Turn it on to read the clock.',[System.Windows.Forms.ToolTipIcon]::Warning) } catch {} }; return }
+    if (Job-Active 'clock') { if ($Notify) { try { $script:ni.ShowBalloonTip(3000,'LYWSD02','A clock read is already in progress...',[System.Windows.Forms.ToolTipIcon]::Info) } catch {} }; return }
     $addr = $script:settings.Address
     $scan = [int]$script:settings.ScanSeconds
     $tmp  = [System.IO.Path]::GetTempFileName()
@@ -592,11 +592,50 @@ function Sample-Aranet {
         if ($LogCsv) { Append-AranetCsv -Co2 $script:lastAranet.Co2 -TempC $script:lastAranet.TempC -Humidity $script:lastAranet.Hum -Pressure $script:lastAranet.Pres -Battery $script:lastAranet.Battery -Status $script:lastAranet.Status }
         WLog "INFO aranet co2=$($script:lastAranet.Co2) status=$($script:lastAranet.Status) (captured $ts)"
     }
-    if ($Notify) { $script:ni.ShowBalloonTip(4000,'Aranet4', ("{0} ppm CO2 ({1})   {2:0.0} hPa   (as of {3})" -f $script:lastAranet.Co2,$script:lastAranet.Status,$script:lastAranet.Pres,$ts), [System.Windows.Forms.ToolTipIcon]::Info) }
+    if ($Notify) {
+        $ageS = [int]((Get-Date)-$when).TotalSeconds
+        $ageTxt = if ($ageS -lt 90) { "captured ${ageS}s ago" } else { "captured at $($when.ToString('HH:mm'))" }
+        $script:ni.ShowBalloonTip(4000,'Aranet4', ("{0} ppm CO2 ({1})   {2:0.0} hPa   -   {3}" -f $script:lastAranet.Co2,$script:lastAranet.Status,$script:lastAranet.Pres,$ageTxt), [System.Windows.Forms.ToolTipIcon]::Info)
+    }
     Set-Tooltip
     $miReading.Text = Reading-Text
     if ($script:popupShown) { try { Update-PopupData; $script:popupPanel.Invalidate() } catch {} }
     Refresh-Dashboard
+}
+# "Read Aranet4 now": the Aranet broadcasts on its own schedule and we can't
+# command it, so instead of just re-showing the cached file, wait (briefly, off
+# the UI thread) for the watcher to capture a NEW broadcast, then sample. If none
+# arrives in the window, say so honestly rather than silently recalling the old one.
+function Read-AranetTs {
+    if (-not (Test-Path $LatestJson)) { return '' }
+    try { return [string]((Get-Content $LatestJson -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json).ts) } catch { return '' }
+}
+function Force-Aranet {
+    if (-not $script:settings.AranetEnabled) { if ($script:ni) { try { $script:ni.ShowBalloonTip(3500,'Aranet4','Aranet tracking is off. Turn it on to read.',[System.Windows.Forms.ToolTipIcon]::Warning) } catch {} }; return }
+    Ensure-AranetWatcher
+    $prev = Read-AranetTs
+    $ageSec = 99999.0
+    if ($prev) { try { $ageSec = ((Get-Date)-[datetime]$prev).TotalSeconds } catch {} }
+    # The Aranet only measures/broadcasts ~once a minute, so a recent capture IS
+    # the freshest the device offers - show it at once. Only wait for the next
+    # packet if what we have is genuinely stale.
+    if ($prev -and $ageSec -lt 75) { Sample-Aranet -LogCsv $true -Notify $true; return }
+    $script:aranetForce = @{ Prev = $prev; Deadline = (Get-Date).AddSeconds(80) }
+    if ($script:ni) { try { $script:ni.ShowBalloonTip(3000,'Aranet4','Waiting for the next broadcast (the Aranet updates about once a minute)...',[System.Windows.Forms.ToolTipIcon]::Info) } catch {} }
+    $script:aranetForceTimer.Start()
+}
+function Aranet-ForceTick {
+    if (-not $script:aranetForce) { $script:aranetForceTimer.Stop(); return }
+    $cur = Read-AranetTs
+    if ($cur -and $cur -ne $script:aranetForce.Prev) {
+        $script:aranetForce = $null; $script:aranetForceTimer.Stop()
+        Sample-Aranet -LogCsv $true -Notify $true
+    } elseif ((Get-Date) -ge $script:aranetForce.Deadline) {
+        $script:aranetForce = $null; $script:aranetForceTimer.Stop()
+        Sample-Aranet -LogCsv $true -Notify $false
+        if ($script:ni) { try { $script:ni.ShowBalloonTip(5000,'Aranet4','No broadcast received - the Aranet may be out of range, the clock read may be using the radio, or Smart Home broadcasting is off in the Aranet app.',[System.Windows.Forms.ToolTipIcon]::Warning) } catch {} }
+        Refresh-Dashboard
+    }
 }
 
 function Read-JobJson($j) {
@@ -661,6 +700,12 @@ function Poll-Jobs {
 $script:poll = New-Object System.Windows.Forms.Timer
 $script:poll.Interval = 1500
 $script:poll.Add_Tick({ Poll-Jobs })
+
+# Polls the latest-reading file while "Read Aranet4 now" waits for a fresh packet.
+$script:aranetForce = $null
+$script:aranetForceTimer = New-Object System.Windows.Forms.Timer
+$script:aranetForceTimer.Interval = 700
+$script:aranetForceTimer.Add_Tick({ Aranet-ForceTick })
 
 # ---- Scheduler: one BLE scan at a time, independent per-device intervals ---
 # Each device has its own "due" time. A single ticking scheduler runs whichever
@@ -1677,16 +1722,19 @@ function Rs-PaintFooter($g, $p) {
     $pen = New-Object Drawing.Pen($T.Hairline,1); $g.DrawLine($pen, 2, 0, ($p.Width-2), 0); $pen.Dispose()
     if (-not $script:rs) { return }
     $cb = $script:rs.ClockBatt; $ab = $script:rs.AranetBatt
-    $cbt = if ($null -ne $cb) { "clock $cb%" } else { 'clock --' }
-    $abt = if ($null -ne $ab) { "Aranet $ab%" } else { 'Aranet --' }
+    $cbt = if ($null -ne $cb) { "$cb%" } else { '--' }
+    $abt = if ($null -ne $ab) { "$ab%" } else { '--' }
     $conn = if ($script:settings.ConnectionEnabled) { 'live' } else { 'paused' }
-    $air = if ($script:rs.AranetWhen) { "CO$($script:RsSub2) as of $($script:rs.AranetWhen.ToString('HH:mm'))" } else { "CO$($script:RsSub2) --" }
+    # show each device's last reading time so a fresh read is visible even when the
+    # value (slow-moving temperature / humidity) reads the same.
+    $clkT = if ($script:rs.ClockWhen) { $script:rs.ClockWhen.ToString('HH:mm') } else { '--' }
+    $airT = if ($script:rs.AranetWhen) { $script:rs.AranetWhen.ToString('HH:mm') } else { '--' }
     $tx = 4
     # a single caution dot only if a sensor has gone stale / offline
     if ($script:rs.AnyStale -or -not $script:settings.ConnectionEnabled) {
         $db = New-Object Drawing.SolidBrush $T.Caution; $g.FillEllipse($db, [single]4, [single]11, [single]7, [single]7); $db.Dispose(); $tx = 16
     }
-    $txt = "updated $($script:rs.Updated.ToString('HH:mm:ss'))   $($script:RsMid)   $conn   $($script:RsMid)   $air   $($script:RsMid)   $cbt   $($script:RsMid)   $abt"
+    $txt = "$conn   $($script:RsMid)   last read  clock $clkT $($script:RsMid) CO$($script:RsSub2) $airT   $($script:RsMid)   battery  clock $cbt $($script:RsMid) Aranet $abt"
     Rs-Txt $g $txt $script:RsFonts.Caption $T.TextT $tx 8
 }
 
@@ -1920,7 +1968,7 @@ function Show-Dashboard {
             ({ param($s,$e); $script:settings.AranetIntervalMinutes = [int]$s.Tag; $script:aranetDue = Get-Date; Save-Settings; Update-Dash-Controls; Refresh-Menu })
         $bSync = New-DashButton 'Sync clock' $T.Accent; $bSync.Location = New-Object System.Drawing.Point(4, 104); $bSync.Add_Click({ Start-Bg -Kind 'sync' -LogCsv $false -Notify $true })
         $bReadC = New-DashButton 'Read clock' $T.Sunken $T.TextP; $bReadC.Location = New-Object System.Drawing.Point(162, 104); $bReadC.Add_Click({ Start-Bg -Kind 'read' -LogCsv $true -Notify $true })
-        $bReadA = New-DashButton 'Read Aranet4' $T.Sunken $T.TextP; $bReadA.Location = New-Object System.Drawing.Point(320, 104); $bReadA.Add_Click({ Ensure-AranetWatcher; Sample-Aranet -LogCsv $true -Notify $true; Refresh-Dashboard })
+        $bReadA = New-DashButton 'Read Aranet4' $T.Sunken $T.TextP; $bReadA.Location = New-Object System.Drawing.Point(320, 104); $bReadA.Add_Click({ Force-Aranet })
         $bData = New-DashButton 'Open data folder' $T.Sunken $T.TextP; $bData.Location = New-Object System.Drawing.Point(478, 104); $bData.Add_Click({ Start-Process explorer.exe $LogDir })
         $ctl.Controls.AddRange(@($bSync, $bReadC, $bReadA, $bData))
         # room volume (m3) - feeds the occupancy mass-balance estimate
@@ -2014,7 +2062,7 @@ function Toggle-Aranet {
 
 # ---- Menu handlers --------------------------------------------------------
 $miRead.Add_Click({ Start-Bg -Kind 'read' -LogCsv $true -Notify $true })
-$miReadAranet.Add_Click({ Ensure-AranetWatcher; Sample-Aranet -LogCsv $true -Notify $true })
+$miReadAranet.Add_Click({ Force-Aranet })
 $miSync.Add_Click({ Start-Bg -Kind 'sync' -LogCsv $false -Notify $true })
 $miTrends.Add_Click({ Show-Dashboard })
 $miConn.Add_Click({ Toggle-Connection })
