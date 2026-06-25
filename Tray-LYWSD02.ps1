@@ -510,8 +510,8 @@ $script:jobs = New-Object System.Collections.ArrayList
 
 function Start-Bg {
     param([ValidateSet('read','sync')] [string]$Kind, [bool]$LogCsv, [bool]$Notify)
-    if (-not $script:settings.ConnectionEnabled) { if ($Notify) { try { $script:ni.ShowBalloonTip(4000,'LYWSD02','Connection is off (battery saver). Turn it on to read the clock.',[System.Windows.Forms.ToolTipIcon]::Warning) } catch {} }; return }
-    if (Job-Active 'clock') { if ($Notify) { try { $script:ni.ShowBalloonTip(3000,'LYWSD02','A clock read is already in progress...',[System.Windows.Forms.ToolTipIcon]::Info) } catch {} }; return }
+    if (-not $script:settings.ConnectionEnabled) { if ($Notify) { Rs-Toast 'LYWSD02' 'Connection is off (battery saver). Turn it on to read the clock.' 'warn' }; return }
+    if (Job-Active 'clock') { if ($Notify) { Rs-Toast 'LYWSD02' 'A clock read is already in progress...' 'info' }; return }
     $addr = $script:settings.Address
     $scan = [int]$script:settings.ScanSeconds
     $tmp  = [System.IO.Path]::GetTempFileName()
@@ -574,7 +574,7 @@ function Sample-Aranet {
         try { $data = Get-Content $LatestJson -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json } catch {}
     }
     if (-not ($data -and $data.ok)) {
-        if ($Notify) { $script:ni.ShowBalloonTip(4000,'Aranet4','No reading captured yet (waiting for a broadcast).',[System.Windows.Forms.ToolTipIcon]::Warning) }
+        if ($Notify) { Rs-Toast 'Aranet4' 'No reading captured yet (waiting for a broadcast).' 'warn' }
         return
     }
     $ts = [string]$data.ts
@@ -595,7 +595,7 @@ function Sample-Aranet {
     if ($Notify) {
         $ageS = [int]((Get-Date)-$when).TotalSeconds
         $ageTxt = if ($ageS -lt 90) { "captured ${ageS}s ago" } else { "captured at $($when.ToString('HH:mm'))" }
-        $script:ni.ShowBalloonTip(4000,'Aranet4', ("{0} ppm CO2 ({1})   {2:0.0} hPa   -   {3}" -f $script:lastAranet.Co2,$script:lastAranet.Status,$script:lastAranet.Pres,$ageTxt), [System.Windows.Forms.ToolTipIcon]::Info)
+        Rs-Toast 'Aranet4' ("{0} ppm CO2 ({1})   {2:0.0} hPa   -   {3}" -f $script:lastAranet.Co2,$script:lastAranet.Status,$script:lastAranet.Pres,$ageTxt) 'info'
     }
     Set-Tooltip
     $miReading.Text = Reading-Text
@@ -611,7 +611,7 @@ function Read-AranetTs {
     try { return [string]((Get-Content $LatestJson -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json).ts) } catch { return '' }
 }
 function Force-Aranet {
-    if (-not $script:settings.AranetEnabled) { if ($script:ni) { try { $script:ni.ShowBalloonTip(3500,'Aranet4','Aranet tracking is off. Turn it on to read.',[System.Windows.Forms.ToolTipIcon]::Warning) } catch {} }; return }
+    if (-not $script:settings.AranetEnabled) { Rs-Toast 'Aranet4' 'Aranet tracking is off. Turn it on to read.' 'warn'; return }
     Ensure-AranetWatcher
     $prev = Read-AranetTs
     $ageSec = 99999.0
@@ -621,7 +621,7 @@ function Force-Aranet {
     # packet if what we have is genuinely stale.
     if ($prev -and $ageSec -lt 75) { Sample-Aranet -LogCsv $true -Notify $true; return }
     $script:aranetForce = @{ Prev = $prev; Deadline = (Get-Date).AddSeconds(80) }
-    if ($script:ni) { try { $script:ni.ShowBalloonTip(3000,'Aranet4','Waiting for the next broadcast (the Aranet updates about once a minute)...',[System.Windows.Forms.ToolTipIcon]::Info) } catch {} }
+    Rs-Toast 'Aranet4' 'Waiting for the next broadcast (the Aranet updates about once a minute)...' 'info'
     $script:aranetForceTimer.Start()
 }
 function Aranet-ForceTick {
@@ -633,7 +633,7 @@ function Aranet-ForceTick {
     } elseif ((Get-Date) -ge $script:aranetForce.Deadline) {
         $script:aranetForce = $null; $script:aranetForceTimer.Stop()
         Sample-Aranet -LogCsv $true -Notify $false
-        if ($script:ni) { try { $script:ni.ShowBalloonTip(5000,'Aranet4','No broadcast received - the Aranet may be out of range, the clock read may be using the radio, or Smart Home broadcasting is off in the Aranet app.',[System.Windows.Forms.ToolTipIcon]::Warning) } catch {} }
+        Rs-Toast 'Aranet4' 'No broadcast received - the Aranet may be out of range, the clock read may be using the radio, or Smart Home broadcasting is off in the Aranet app.' 'warn'
         Refresh-Dashboard
     }
 }
@@ -659,18 +659,18 @@ function Complete-Clock($j, $data) {
         if ($j.LogCsv) { Append-Csv -TempC $tc -Humidity $hu -Battery $bat }
         if ($j.Notify) {
             $batTxt = if ($null -eq $bat) { '?' } else { "$bat%" }
-            $script:ni.ShowBalloonTip(4000,'LYWSD02', ("{0:0.0} C   {1}% RH   battery {2}" -f $tc,$hu,$batTxt), [System.Windows.Forms.ToolTipIcon]::Info)
+            Rs-Toast 'LYWSD02' ("{0:0.0} C   {1}% RH   battery {2}" -f $tc,$hu,$batTxt) 'info'
         }
     } else {
         if ($j.Kind -eq 'read') { Update-Icon '--' (-not $script:settings.ConnectionEnabled) }
         if ($j.Notify) {
             $msg = if ($j.Kind -eq 'sync') { 'Clock sync failed (not seen / out of range).' } else { 'Could not read the clock (not seen / out of range).' }
-            $script:ni.ShowBalloonTip(4000,'LYWSD02',$msg,[System.Windows.Forms.ToolTipIcon]::Warning)
+            Rs-Toast 'LYWSD02' $msg 'warn'
         }
         WLog "WARN clock $($j.Kind) failed"
         return
     }
-    if ($j.Kind -eq 'sync' -and $j.Notify) { $script:ni.ShowBalloonTip(4000,'LYWSD02','Clock time synchronised.',[System.Windows.Forms.ToolTipIcon]::Info) }
+    if ($j.Kind -eq 'sync' -and $j.Notify) { Rs-Toast 'LYWSD02' 'Clock time synchronised.' 'info' }
     if ($j.Kind -eq 'sync') { WLog 'INFO clock synced' }
 }
 
@@ -1737,6 +1737,41 @@ function Rs-PaintFooter($g, $p) {
     $txt = "$conn   $($script:RsMid)   last read  clock $clkT $($script:RsMid) CO$($script:RsSub2) $airT   $($script:RsMid)   battery  clock $cbt $($script:RsMid) Aranet $abt"
     Rs-Txt $g $txt $script:RsFonts.Caption $T.TextT $tx 8
 }
+# Notify the user: an in-window toast when the dashboard is open (so reads done
+# from the window surface in the window), else the tray balloon.
+function Rs-Toast($title, $msg, $kind) {
+    if ($script:dash -and $script:dash.Form -and -not $script:dash.Form.IsDisposed -and $script:dash.Toast -and -not $script:dash.Toast.IsDisposed) {
+        Ensure-RsFonts
+        $t = $script:dash.Toast; $f = $script:dash.Form
+        $t.Tag = @{ Title=[string]$title; Msg=[string]$msg; Kind=[string]$kind }
+        $gg = $t.CreateGraphics()
+        $mw = [int]($gg.MeasureString([string]$msg, $script:RsFonts.Body).Width)
+        $tw = [int]($gg.MeasureString([string]$title, $script:RsFonts.Caption).Width)
+        $gg.Dispose()
+        $wide = ([Math]::Max($mw,$tw)) + 56
+        $wmax = $f.ClientSize.Width - 80; if ($wide -gt $wmax) { $wide = $wmax }; if ($wide -lt 200) { $wide = 200 }
+        $th = 52
+        $t.Size = New-Object System.Drawing.Size([int]$wide, $th)
+        $t.Location = New-Object System.Drawing.Point([int](($f.ClientSize.Width-$wide)/2), [int]($f.ClientSize.Height - 176 - $th - 14))
+        $t.Visible = $true; $t.BringToFront(); $t.Invalidate()
+        if ($script:dash.ToastTimer) { $script:dash.ToastTimer.Stop(); $script:dash.ToastTimer.Start() }
+    } elseif ($script:ni) {
+        $icon = if ($kind -eq 'warn') { [System.Windows.Forms.ToolTipIcon]::Warning } else { [System.Windows.Forms.ToolTipIcon]::Info }
+        try { $script:ni.ShowBalloonTip(4000, [string]$title, [string]$msg, $icon) } catch {}
+    }
+}
+function Rs-PaintToast($g, $p) {
+    $T = $script:DashTheme; Ensure-RsFonts; $d = $p.Tag
+    $g.SmoothingMode='AntiAlias'; $g.TextRenderingHint='ClearTypeGridFit'; $g.Clear($T.Canvas)
+    $w=[int]$p.Width; $h=[int]$p.Height
+    Rs-Fill $g $T.Sunken 0 0 ($w-1) ($h-1) 12
+    Rs-Stroke $g $T.Hairline 0 0 ($w-1) ($h-1) 12
+    if (-not $d) { return }
+    $acc = if ($d.Kind -eq 'warn') { $T.Caution } else { $T.Accent }
+    $db = New-Object Drawing.SolidBrush $acc; $g.FillEllipse($db, [single]18, [single](($h/2)-4), [single]8, [single]8); $db.Dispose()
+    if ($d.Title) { Rs-Txt $g $d.Title $script:RsFonts.Caption $acc 36 9 }
+    Rs-Txt $g $d.Msg $script:RsFonts.Body $T.TextP 36 ($(if ($d.Title) {25} else {18}))
+}
 
 # Hover popup: compact Room State summary (verdict + 4 readings + CO2 sparkline).
 function Update-PopupData {
@@ -1988,6 +2023,14 @@ function Show-Dashboard {
 
         $tl.Controls.Add($verdict, 0, 0); $tl.Controls.Add($body, 0, 1); $tl.Controls.Add($ctl, 0, 2); $tl.Controls.Add($footer, 0, 3)
         $f.Controls.Add($tl)
+
+        # in-window toast for read feedback (floats above the cards, auto-hides)
+        $toast = New-Object Vulcan.CardPanel; $toast.BackColor = $T.Canvas; $toast.Visible = $false; $toast.Tag = $null
+        $toast.Add_Paint({ param($s,$e); try { Rs-PaintToast $e.Graphics $this } catch { WLog "toast: $($_.Exception.Message)" } })
+        $f.Controls.Add($toast); $toast.BringToFront()
+        $script:dash.Toast = $toast
+        $script:dash.ToastTimer = New-Object System.Windows.Forms.Timer; $script:dash.ToastTimer.Interval = 5500
+        $script:dash.ToastTimer.Add_Tick({ try { $script:dash.ToastTimer.Stop(); if ($script:dash -and $script:dash.Toast -and -not $script:dash.Toast.IsDisposed) { $script:dash.Toast.Visible = $false } } catch {} })
 
         $script:dash.Panels = @($verdict, $aq, $occ, $vCards['temp'], $vCards['hum'], $vCards['co2'], $vCards['pres'], $vent, $comf, $outs, $timeline, $footer)
         $script:dash.AnimPanels = @($aq, $vCards['temp'], $vCards['hum'], $vCards['co2'], $vCards['pres'], $vent, $comf)
