@@ -7,7 +7,9 @@
     Bluetooth address of your clock, e.g. "E7:2E:01:92:C1:1F". Recommended.
 
 .PARAMETER IntervalMinutes
-    How often to read + log temperature/humidity. Default 60 (hourly).
+    How often to read + log the clock's temperature/humidity. Default 60 (hourly).
+    An existing setting is kept unless you pass this. (The Aranet4 needs no
+    interval: every measurement it broadcasts is logged.)
 
 .PARAMETER ScanSeconds
     BLE scan window per read. Default 90 (the clock advertises intermittently).
@@ -27,7 +29,6 @@
 param(
     [string]$Address,
     [int]$IntervalMinutes = 60,
-    [int]$AranetIntervalMinutes = 5,
     [int]$ScanSeconds = 90,
     [switch]$NoStartup,
     [switch]$Uninstall
@@ -54,18 +55,21 @@ if ($Uninstall) {
     return
 }
 
-# Merge/update settings.json
+# Merge/update settings.json: start from the defaults, keep whatever is already
+# saved, then apply the parameters that were passed explicitly.
 $settings = [ordered]@{
-    Address           = $Address
+    Address           = ''
     DeviceName        = 'LYWSD02'
-    ScanSeconds       = $ScanSeconds
-    IntervalMinutes   = $IntervalMinutes
+    ScanSeconds       = 90
+    IntervalMinutes   = 60
     ConnectionEnabled = $true
     HourlyLogging     = $true
     AranetEnabled     = $true
-    AranetIntervalMinutes = $AranetIntervalMinutes
-    AranetScanSeconds = 150
+    RoomName          = 'Living room'
     RoomVolume        = 29
+    AlertsEnabled     = $true
+    QuietNight        = $true
+    Theme             = 'dark'
     TrendRange        = '7d'
     TrendFrom         = ''
     TrendTo           = ''
@@ -73,20 +77,12 @@ $settings = [ordered]@{
 if (Test-Path $settingsPath) {
     try {
         $old = Get-Content $settingsPath -Raw | ConvertFrom-Json
-        if (-not $Address -and $old.Address) { $settings.Address = $old.Address }
-        if ($null -ne $old.ConnectionEnabled) { $settings.ConnectionEnabled = [bool]$old.ConnectionEnabled }
-        if ($null -ne $old.HourlyLogging)     { $settings.HourlyLogging = [bool]$old.HourlyLogging }
-        if ($old.IntervalMinutes -and -not $PSBoundParameters.ContainsKey('IntervalMinutes')) { $settings.IntervalMinutes = [int]$old.IntervalMinutes }
-        if ($null -ne $old.AranetEnabled)     { $settings.AranetEnabled = [bool]$old.AranetEnabled }
-        if ($old.AranetScanSeconds)           { $settings.AranetScanSeconds = [int]$old.AranetScanSeconds }
-        # Preserve a saved interval unless the caller explicitly overrode it.
-        if ($old.AranetIntervalMinutes -and -not $PSBoundParameters.ContainsKey('AranetIntervalMinutes')) { $settings.AranetIntervalMinutes = [int]$old.AranetIntervalMinutes }
-        if ($old.RoomVolume)  { $settings.RoomVolume  = [int]$old.RoomVolume }
-        if ($old.TrendRange) { $settings.TrendRange = $old.TrendRange }
-        if ($old.TrendFrom)  { $settings.TrendFrom  = $old.TrendFrom }
-        if ($old.TrendTo)    { $settings.TrendTo    = $old.TrendTo }
+        foreach ($k in @($settings.Keys)) { if ($null -ne $old.$k) { $settings[$k] = $old.$k } }
     } catch {}
 }
+if ($Address) { $settings.Address = $Address }
+if ($PSBoundParameters.ContainsKey('IntervalMinutes')) { $settings.IntervalMinutes = $IntervalMinutes }
+if ($PSBoundParameters.ContainsKey('ScanSeconds')) { $settings.ScanSeconds = $ScanSeconds }
 ($settings | ConvertTo-Json) | Set-Content -Path $settingsPath -Encoding UTF8
 Write-Host "Wrote settings: $settingsPath" -ForegroundColor Green
 Write-Host ("  Address={0}  Interval={1}m  Scan={2}s" -f ($(if($settings.Address){$settings.Address}else{'(scan by name)'})), $settings.IntervalMinutes, $settings.ScanSeconds)

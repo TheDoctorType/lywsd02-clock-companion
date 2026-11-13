@@ -1,56 +1,90 @@
 <#
 .SYNOPSIS
-    System-tray widget for the Xiaomi LYWSD02 clock. Shows the current
-    temperature in the taskbar tray, logs temperature/humidity hourly to CSV,
-    lets you toggle the Bluetooth connection on/off to save battery, and can
-    trigger a clock time-sync on demand.
+    System-tray widget for the Xiaomi LYWSD02 clock and an Aranet4 CO2 monitor.
+    Shows the temperature in the taskbar tray, logs both devices to CSV, raises
+    alerts, and opens a "Room state" dashboard that reads the room for you.
 
 .DESCRIPTION
-    Runs as a hidden PowerShell process with a NotifyIcon. All Bluetooth work is
-    delegated to Sync-LYWSD02.ps1 (-ReadSensors / time-sync, -Json) run as short
-    child processes, so the UI never blocks during a BLE scan.
+    Runs as a hidden PowerShell process with a NotifyIcon. Bluetooth work is done
+    by child processes (Sync-LYWSD02.ps1 for the clock, Watch-Aranet4.ps1 for the
+    Aranet), so the UI never blocks on a scan. Both histories are held in memory
+    by the compiled core (Vulcan.Core.cs), which also does the inference maths and
+    the drawing primitives - this script is the UI and the scheduling.
 
-    Launch hidden via Start-Widget.vbs (Install-Widget.ps1 sets that up and adds
-    a Startup shortcut). Settings persist in settings.json; data in logs\sensors.csv.
+    Launch hidden via Start-Widget.vbs (Install-Widget.ps1 sets that up).
+    Settings persist in settings.json; data in logs\sensors.csv and logs\aranet4.csv.
+
+.PARAMETER SelfTest
+    Developer check: build the whole UI against the real data, save screenshots
+    into the given folder and exit. Touches no device, setting or log.
 #>
 [CmdletBinding()]
-param([string]$SettingsPath)
+param([string]$SettingsPath, [string]$SelfTest, [string]$SelfTestTheme, [string]$SelfTestSize)
 
 $ErrorActionPreference = 'Stop'
 
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot }
              elseif ($PSCommandPath) { Split-Path -Parent $PSCommandPath }
              else { Split-Path -Parent $MyInvocation.MyCommand.Path }
-$SyncScript   = Join-Path $ScriptDir 'Sync-LYWSD02.ps1'   # clock device (per-read scan)
+$SyncScript   = Join-Path $ScriptDir 'Sync-LYWSD02.ps1'   # clock device (one scan per read)
 $WatchScript  = Join-Path $ScriptDir 'Watch-Aranet4.ps1'  # air-quality device (persistent listener)
 if (-not $SettingsPath) { $SettingsPath = Join-Path $ScriptDir 'settings.json' }
-$LogDir     = Join-Path $ScriptDir 'logs'
-$CsvPath    = Join-Path $LogDir 'sensors.csv'        # LYWSD02 history
-$AranetCsv  = Join-Path $LogDir 'aranet4.csv'        # Aranet4 history
-$LatestJson = Join-Path $LogDir 'aranet-latest.json' # latest Aranet reading (written by the watcher)
-$AchFile    = Join-Path $LogDir 'ach.json'           # last good ventilation estimate (survives restarts)
-$WidgetLog  = Join-Path $LogDir 'widget.log'
+$LogDir       = Join-Path $ScriptDir 'logs'
+$CacheDir     = Join-Path $LogDir 'cache'
+$CsvPath      = Join-Path $LogDir 'sensors.csv'           # LYWSD02 history
+$AranetCsv    = Join-Path $LogDir 'aranet4.csv'           # Aranet4 history
+$LatestJson   = Join-Path $LogDir 'aranet-latest.json'    # latest Aranet reading (written by the watcher)
+$WatchPidFile = Join-Path $LogDir 'aranet-watcher.pid'
+$WidgetLog    = Join-Path $LogDir 'widget.log'
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Force -Path $LogDir | Out-Null }
 
 function WLog([string]$m) {
-    try { Add-Content -Path $WidgetLog -Value ("{0} {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m) -Encoding UTF8 } catch {}
+    if ($SelfTest) { Write-Host $m; return }
+    try { [System.IO.File]::AppendAllText($WidgetLog, ("{0} {1}`r`n" -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $m)) } catch {}
 }
 
-# ---- Settings -------------------------------------------------------------
+# ---- Single instance, then the assemblies everything below depends on ----
+if (-not $SelfTest) {
+    $createdNew = $false
+    $script:mutex = New-Object System.Threading.Mutex($true, 'LYWSD02_Tray_Widget_Mutex', [ref]$createdNew)
+    if (-not $createdNew) {
+        # Already running: ask that instance to show its dashboard, then leave.
+        try { $ev = [System.Threading.EventWaitHandle]::OpenExisting('LYWSD02_Show_Dashboard'); [void]$ev.Set(); $ev.Dispose() } catch {}
+        return
+    }
+}
+
+$swStart = [System.Diagnostics.Stopwatch]::StartNew()
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+. (Join-Path $ScriptDir 'Compile-Cache.ps1')
+$coreHow = Import-CachedAssembly -Name 'vulcan-core' -Source ([System.IO.File]::ReadAllText((Join-Path $ScriptDir 'Vulcan.Core.cs'))) -CacheDir $CacheDir -ProbeType 'Vulcan.Model' -References {
+    'System.dll', 'System.Core.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll', 'System.Windows.Forms.DataVisualization.dll'
+}
+[System.Windows.Forms.Application]::EnableVisualStyles()
+# Log UI-thread exceptions instead of popping a modal error dialog.
+[System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException)
+[System.Windows.Forms.Application]::add_ThreadException({ param($s,$e) try { WLog "THREADEXC: $($e.Exception.Message)" } catch {} })
+
+# ===========================================================================
+#  Settings
+# ===========================================================================
 $DefaultSettings = [ordered]@{
-    Address         = ''
-    DeviceName      = 'LYWSD02'
-    ScanSeconds     = 90
-    IntervalMinutes = 60
+    Address           = ''
+    DeviceName        = 'LYWSD02'
+    ScanSeconds       = 90
+    IntervalMinutes   = 60
     ConnectionEnabled = $true
-    HourlyLogging   = $true
-    AranetEnabled   = $true
-    AranetIntervalMinutes = 5
-    AranetScanSeconds = 150
-    RoomVolume      = 29        # m3 (~3 x 4 x 2.4); used by the occupancy estimate
-    TrendRange      = '7d'
-    TrendFrom       = ''
-    TrendTo         = ''
+    HourlyLogging     = $true
+    AranetEnabled     = $true
+    RoomName          = 'Living room'
+    RoomVolume        = 29        # m3 (~3 x 4 x 2.4); used by the occupancy estimate
+    AlertsEnabled     = $true
+    QuietNight        = $true     # no pop-up notifications 22:00-07:00
+    Theme             = 'dark'
+    TrendRange        = '7d'
+    TrendFrom         = ''
+    TrendTo           = ''
 }
 function Load-Settings {
     $s = [ordered]@{}
@@ -58,184 +92,792 @@ function Load-Settings {
     if (Test-Path $SettingsPath) {
         try {
             $j = Get-Content $SettingsPath -Raw | ConvertFrom-Json
-            foreach ($k in @($DefaultSettings.Keys)) {
-                if ($null -ne $j.$k) { $s[$k] = $j.$k }
-            }
+            foreach ($k in @($DefaultSettings.Keys)) { if ($null -ne $j.$k) { $s[$k] = $j.$k } }
         } catch { WLog "WARN could not parse settings.json: $($_.Exception.Message)" }
     }
     return $s
 }
 function Save-Settings {
+    if ($SelfTest) { return }
     try { ($script:settings | ConvertTo-Json) | Set-Content -Path $SettingsPath -Encoding UTF8 }
     catch { WLog "WARN could not save settings: $($_.Exception.Message)" }
 }
-$script:settings = Load-Settings
+function Clock-Interval { $m = [int]$script:settings.IntervalMinutes; if ($m -lt 1) { 60 } else { $m } }
+function NVal($v) { if ($null -eq $v) { return $null }; $d = [double]$v; if ([double]::IsNaN($d)) { return $null }; return $d }
+function NNum($v) { if ($null -eq $v) { return [double]::NaN }; return [double]$v }
 
-# ---- Single instance ------------------------------------------------------
-$createdNew = $false
-$script:mutex = New-Object System.Threading.Mutex($true, 'LYWSD02_Tray_Widget_Mutex', [ref]$createdNew)
-if (-not $createdNew) { WLog "Another instance is already running; exiting."; return }
+# ===========================================================================
+#  Theme, fonts, small drawing helpers
+# ===========================================================================
+$script:RsDeg=[char]0x00B0; $script:RsMid=[char]0x00B7; $script:RsNd=[char]0x2013; $script:RsEm=[char]0x2014
+$script:RsSub2=[char]0x2082; $script:RsSup3=[char]0x00B3; $script:RsApx=[char]0x2248
+$script:RsUp=[char]0x2191; $script:RsDn=[char]0x2193; $script:RsRt=[char]0x2192
+$script:RsDR=[char]0x2198; $script:RsUR=[char]0x2197
+$script:GlRefresh=[string][char]0xE72C; $script:GlGear=[string][char]0xE713; $script:GlEdit=[string][char]0xE70F
+$script:GlSync=[string][char]0xE895; $script:GlChart=[string][char]0xE9D2; $script:GlClose=[string][char]0xE8BB
+$script:GlFolder=[string][char]0xE8B7
+$script:RsFonts = $null
 
-# ---- WinForms / GDI -------------------------------------------------------
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-Add-Type -AssemblyName System.Windows.Forms.DataVisualization
-Add-Type -Namespace LywsdNative -Name U32 -MemberDefinition @'
-[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError=true)]
-public static extern bool DestroyIcon(System.IntPtr handle);
-'@
-# A borderless top-level window that shows WITHOUT stealing keyboard focus and
-# stays out of Alt-Tab - used for the hover popup.
-Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @'
-using System;
-using System.Windows.Forms;
-public class NoActivatePopup : Form {
-    protected override bool ShowWithoutActivation { get { return true; } }
-    protected override CreateParams CreateParams {
-        get { var cp = base.CreateParams; cp.ExStyle |= 0x08000000 /*WS_EX_NOACTIVATE*/ | 0x00000080 /*WS_EX_TOOLWINDOW*/; return cp; }
+function Build-Theme($mode) {
+    $c = { param($r,$g,$b) [System.Drawing.Color]::FromArgb($r,$g,$b) }
+    if ($mode -eq 'light') {
+        $t = @{ Mode='light'
+            Canvas=(& $c 246 246 243); Surface=(& $c 255 255 255); Sunken=(& $c 238 238 234); Hover=(& $c 226 226 221)
+            TextP=(& $c 21 22 26); TextS=(& $c 92 94 102); TextT=(& $c 138 140 148)
+            Hairline=[System.Drawing.Color]::FromArgb(22,20,22,26); Accent=(& $c 15 158 142); AccentWash=[System.Drawing.Color]::FromArgb(24,15,158,142)
+            Caution=(& $c 193 138 46); Alert=(& $c 192 87 59); OnAccent=(& $c 255 255 255) }
+    } else {
+        $t = @{ Mode='dark'
+            Canvas=(& $c 13 14 16); Surface=(& $c 23 24 27); Sunken=(& $c 30 31 35); Hover=(& $c 42 44 50)
+            TextP=(& $c 244 244 241); TextS=(& $c 162 164 172); TextT=(& $c 110 112 119)
+            Hairline=[System.Drawing.Color]::FromArgb(20,255,255,255); Accent=(& $c 43 182 164); AccentWash=[System.Drawing.Color]::FromArgb(28,43,182,164)
+            Caution=(& $c 214 162 74); Alert=(& $c 215 122 92); OnAccent=(& $c 13 14 16) }
+    }
+    return $t
+}
+function Apply-Theme($mode) {
+    $script:DashTheme = Build-Theme $mode
+    foreach ($k in 'Canvas','Surface','Sunken','Hover','TextP','TextS','TextT','Hairline','Accent','AccentWash','Caution','Alert','OnAccent') {
+        [Vulcan.Theme].GetField($k).SetValue($null, $script:DashTheme[$k])
     }
 }
-'@ -WarningAction SilentlyContinue
-[System.Windows.Forms.Application]::EnableVisualStyles()
-# Log UI-thread exceptions to widget.log instead of popping a modal error dialog.
-[System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException)
-[System.Windows.Forms.Application]::add_ThreadException({ param($s,$e) try { WLog "THREADEXC: $($e.Exception.Message)" } catch {} })
+function Ensure-RsFonts {
+    if ($script:RsFonts) { return }
+    $sb = 'Segoe UI Semibold'; $ui = 'Segoe UI'
+    $script:RsFonts = @{
+        Verdict = New-Object System.Drawing.Font($sb, 21)
+        Title   = New-Object System.Drawing.Font($sb, 11.5)
+        Value   = New-Object System.Drawing.Font($sb, 20)
+        Big     = New-Object System.Drawing.Font($sb, 27)
+        Unit    = New-Object System.Drawing.Font($ui, 9.5)
+        Body    = New-Object System.Drawing.Font($ui, 9.5)
+        BodyB   = New-Object System.Drawing.Font($sb, 9.5)
+        Caption = New-Object System.Drawing.Font($ui, 8.25)
+        Section = New-Object System.Drawing.Font($sb, 7.5)
+        Arrow   = New-Object System.Drawing.Font($sb, 17)
+        Glyph   = New-Object System.Drawing.Font('Segoe MDL2 Assets', 8)
+    }
+}
+function Rs-Skel { if ($script:DashTheme.Mode -eq 'light') { [System.Drawing.Color]::FromArgb(18,20,22,26) } else { [System.Drawing.Color]::FromArgb(26,255,255,255) } }
+function Rs-StateColor($state) { $T = $script:DashTheme; if ($state -eq 'alert') { return $T.Alert }; if ($state -eq 'caution') { return $T.Caution }; return $T.Accent }
+function Rs-AgeText([double]$min) { if ($min -lt 1) { 'just now' } elseif ($min -lt 90) { "$([int]$min) min ago" } else { '{0:0.0} h ago' -f ($min/60) } }
+function Rs-Person($g, [int]$cx, [int]$top, [int]$size, $color) {
+    $pen = New-Object System.Drawing.Pen($color, 1.5); $pen.LineJoin = [System.Drawing.Drawing2D.LineJoin]::Round
+    $hd = [int]($size*0.34)
+    $g.DrawEllipse($pen, [single]($cx-$hd/2), [single]$top, [single]$hd, [single]$hd)
+    $bx = $cx-$size/2+$size*0.12; $bw = $size-$size*0.24; $by = $top+$hd+2; $bh = $size-$hd-2
+    $g.DrawArc($pen, [single]$bx, [single]$by, [single]$bw, [single]($bh*2), 180, 180); $pen.Dispose()
+}
+function Rs-Icon($g, $name, [int]$x, [int]$y, [int]$s, $color) {
+    $pen = New-Object System.Drawing.Pen($color, 1.5); $pen.StartCap='Round'; $pen.EndCap='Round'; $pen.LineJoin='Round'
+    switch ($name) {
+        'temp' { $g.DrawArc($pen,[single]($x+$s*0.28),[single]$y,[single]($s*0.44),[single]($s*0.44),0,360); $g.DrawLine($pen,[single]($x+$s*0.5),[single]($y+$s*0.18),[single]($x+$s*0.5),[single]($y+$s*0.62)) }
+        'drop' { $g.DrawArc($pen,[single]($x+$s*0.2),[single]($y+$s*0.3),[single]($s*0.6),[single]($s*0.6),30,300); $g.DrawLine($pen,[single]($x+$s*0.5),[single]($y+$s*0.05),[single]($x+$s*0.22),[single]($y+$s*0.45)); $g.DrawLine($pen,[single]($x+$s*0.5),[single]($y+$s*0.05),[single]($x+$s*0.78),[single]($y+$s*0.45)) }
+        'air'  { $g.DrawArc($pen,[single]($x+$s*0.1),[single]($y+$s*0.25),[single]($s*0.5),[single]($s*0.3),90,260); $g.DrawLine($pen,[single]($x+$s*0.1),[single]($y+$s*0.4),[single]($x+$s*0.75),[single]($y+$s*0.4)) }
+        'gauge'{ $g.DrawArc($pen,[single]($x+$s*0.1),[single]($y+$s*0.2),[single]($s*0.8),[single]($s*0.8),180,180); $g.DrawLine($pen,[single]($x+$s*0.5),[single]($y+$s*0.6),[single]($x+$s*0.7),[single]($y+$s*0.35)) }
+    }
+    $pen.Dispose()
+}
 
-$script:iconHandle = [IntPtr]::Zero
-$script:job = $null           # @{ Proc; Out; Kind; LogCsv; Notify }
-$script:lastText = '...'
-
-# ---- Tray icon rendering --------------------------------------------------
+# ===========================================================================
+#  Tray icon
+# ===========================================================================
+$script:iconHandle = [IntPtr]::Zero; $script:iconKey = ''
 function Update-Icon {
-    param([string]$Text, [bool]$Dim)
-    $script:lastText = $Text
+    param([string]$Text, [bool]$Dim, [string]$Level = 'good')
+    $key = "$Text|$Dim|$Level"
+    if ($key -eq $script:iconKey -and $script:iconHandle -ne [IntPtr]::Zero) { return }
+    $script:iconKey = $key; $script:lastText = $Text
     $bmp = New-Object System.Drawing.Bitmap 32,32
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-    $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
+    $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
     $g.Clear([System.Drawing.Color]::Transparent)
-    $bg = if ($Dim) { [System.Drawing.Color]::FromArgb(150, 96,96,96) } else { [System.Drawing.Color]::FromArgb(230, 28,90,160) }
-    $bgBrush = New-Object System.Drawing.SolidBrush $bg
-    $g.FillRectangle($bgBrush, 1,1,30,30)
+    # colour carries the room state: blue = fine, amber = attention, red = act, grey = Bluetooth off
+    $bg = [System.Drawing.Color]::FromArgb(235, 28, 90, 160)
+    if ($Dim) { $bg = [System.Drawing.Color]::FromArgb(160, 96, 96, 96) }
+    elseif ($Level -eq 'alert') { $bg = [System.Drawing.Color]::FromArgb(240, 196, 64, 44) }
+    elseif ($Level -eq 'caution') { $bg = [System.Drawing.Color]::FromArgb(240, 186, 122, 22) }
+    [Vulcan.Gfx]::Fill($g, $bg, 1, 1, 30, 30, 7)
     $size = if ($Text.Length -ge 3) { 15 } else { 19 }
     $font = New-Object System.Drawing.Font('Segoe UI', $size, [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
     $fmt = New-Object System.Drawing.StringFormat
-    $fmt.Alignment = [System.Drawing.StringAlignment]::Center
-    $fmt.LineAlignment = [System.Drawing.StringAlignment]::Center
-    $rect = New-Object System.Drawing.RectangleF(0,0,32,32)
-    $g.DrawString($Text, $font, [System.Drawing.Brushes]::White, $rect, $fmt)
-    $g.Dispose(); $font.Dispose(); $bgBrush.Dispose()
+    $fmt.Alignment = [System.Drawing.StringAlignment]::Center; $fmt.LineAlignment = [System.Drawing.StringAlignment]::Center
+    $g.DrawString($Text, $font, [System.Drawing.Brushes]::White, (New-Object System.Drawing.RectangleF(0,0,32,32)), $fmt)
+    $g.Dispose(); $font.Dispose(); $fmt.Dispose()
     $newHandle = $bmp.GetHicon()
     $icon = [System.Drawing.Icon]::FromHandle($newHandle)
     $bmp.Dispose()
     $old = $script:iconHandle
     $script:ni.Icon = $icon
     $script:iconHandle = $newHandle
-    if ($old -ne [IntPtr]::Zero) { [void][LywsdNative.U32]::DestroyIcon($old) }
+    if ($old -ne [IntPtr]::Zero) { [void][Vulcan.Native]::DestroyIcon($old) }
+}
+function Reading-Text {
+    $rs = $script:rs
+    if (-not $rs -or ($null -eq $rs.Temp -and $null -eq $rs.Co2)) { return 'No reading yet' }
+    $parts = @()
+    if ($null -ne $rs.Temp) { $parts += ('{0:0.0}{1}C' -f $rs.Temp, $script:RsDeg) }
+    if ($null -ne $rs.Hum)  { $parts += ('{0:0}% RH' -f $rs.Hum) }
+    if ($null -ne $rs.Co2)  { $parts += ('{0:0} ppm' -f $rs.Co2) }
+    return ($parts -join "  $($script:RsMid)  ")
+}
+function Set-Tooltip {
+    # NotifyIcon.Text is limited to 63 characters
+    $t = if (-not $script:settings.ConnectionEnabled) { 'Room state - Bluetooth off' } else { Reading-Text }
+    if ($t.Length -gt 63) { $t = $t.Substring(0, 60) + '...' }
+    try { $script:ni.Text = $t } catch {}
 }
 
-# ---- CSV ------------------------------------------------------------------
-function Append-Csv {
-    param([double]$TempC,[int]$Humidity,$Battery)
-    try {
-        if (-not (Test-Path $CsvPath)) {
-            Set-Content -Path $CsvPath -Value 'timestamp,tempC,tempF,humidity,battery' -Encoding UTF8
-        }
-        $tf = [math]::Round($TempC * 9/5 + 32, 1)
-        $bat = if ($null -eq $Battery) { '' } else { $Battery }
-        $row = '{0},{1},{2},{3},{4}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $TempC, $tf, $Humidity, $bat
-        Add-Content -Path $CsvPath -Value $row -Encoding UTF8
-    } catch { WLog "WARN csv append failed: $($_.Exception.Message)" }
+# ===========================================================================
+#  State: readings -> what they mean  (the heavy lifting is in Vulcan.Model)
+# ===========================================================================
+$script:lastReading = $null    # @{ TempC; Humidity; Battery; When }
+$script:lastAranet  = $null    # @{ Co2; TempC; Hum; Pres; Battery; Status; When (measured); Captured; Interval }
+$script:rs = $null
+$script:alerts = [ordered]@{}
+$script:rsDisp = @{}; $script:rsTarget = @{}
+$script:rsVAlpha = 1.0; $script:rsPrevVerdict = ''; $script:rsSettle = @{}; $script:rsScrubFrac = $null
+$script:rsReduced = $false
+
+function Seed-Readings {
+    # Show the last logged values at once on launch instead of "..." until the first Bluetooth read.
+    $now = Get-Date; $C = [Vulcan.Data]::Clock; $A = [Vulcan.Data]::Air
+    if ($C.Count -gt 0 -and ($now - $C.LastTime).TotalHours -lt 12) {
+        $hu = NVal $C.Last(1); if ($null -eq $hu) { $hu = 0 }
+        $script:lastReading = @{ TempC = $C.Last(0); Humidity = [int]$hu; Battery = (NVal $C.Last(2)); When = $C.LastTime }
+    }
+    if ($A.Count -gt 0 -and ($now - $A.LastTime).TotalHours -lt 12) {
+        $script:lastAranet = @{ Co2 = [int]$A.Last(0); TempC = (NVal $A.Last(1)); Hum = (NVal $A.Last(2)); Pres = (NVal $A.Last(3)); Battery = (NVal $A.Last(4))
+                                Status = ''; When = $A.LastTime; Captured = $A.LastTime; Interval = 0 }
+    }
 }
-function Append-AranetCsv {
-    param([int]$Co2,[double]$TempC,[int]$Humidity,[double]$Pressure,$Battery,[string]$Status)
-    try {
-        if (-not (Test-Path $AranetCsv)) {
-            Set-Content -Path $AranetCsv -Value 'timestamp,co2,tempC,humidity,pressure,battery,status' -Encoding UTF8
-        }
-        $bat = if ($null -eq $Battery) { '' } else { $Battery }
-        $row = '{0},{1},{2},{3},{4},{5},{6}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Co2, $TempC, $Humidity, $Pressure, $bat, $Status
-        Add-Content -Path $AranetCsv -Value $row -Encoding UTF8
-    } catch { WLog "WARN aranet csv append failed: $($_.Exception.Message)" }
+function Rs-ReducedMotion {
+    try { return ([string](Get-ItemProperty 'HKCU:\Control Panel\Desktop\WindowMetrics' -Name MinAnimate -ErrorAction Stop).MinAnimate -eq '0') } catch { return $false }
+}
+function Rs-AchBand($ach) {
+    if ($null -eq $ach)   { return @{ Band = 'Estimating'; Level = -1 } }
+    if ($ach -lt 0.4)     { return @{ Band = 'Poor';     Level = 0 } }
+    if ($ach -lt 1.2)     { return @{ Band = 'Moderate'; Level = 1 } }
+    if ($ach -lt 4.0)     { return @{ Band = 'Good';     Level = 2 } }
+    return @{ Band = 'Breezy'; Level = 3 }
+}
+function Rs-Delta1h($tbl, [int]$col, $cur, $now) {
+    if ($null -eq $cur) { return $null }
+    $p = $tbl.ValueNear($col, $now.AddHours(-1), 15)
+    if ([double]::IsNaN($p)) { return $null }
+    return ([double]$cur - $p)
+}
+function Rs-Verdict($co2, $airStale, $temp, $rh, $dew, $occ, $M) {
+    if ($null -eq $co2 -and $null -eq $temp) { return @{ Line = 'Waiting for sensors.'; State = 'good' } }
+    $airState = 'good'; $airWord = ''
+    if ($null -ne $co2 -and -not $airStale) {
+        if ($co2 -lt 800) { $airWord = 'Fresh' }
+        elseif ($co2 -lt 1200) { $airWord = 'Air is fine' }
+        elseif ($co2 -lt 2000) { $airWord = 'Air is getting stuffy'; $airState = 'caution' }
+        else { $airWord = 'Air is poor'; $airState = 'alert' }
+        if ($M.AchLive -and $co2 -ge 800 -and (NNum (NVal $M.Co2Slope)) -lt -200) { $airWord = 'Air is clearing' }
+    }
+    $cWord = ''; $cState = 'good'
+    if ($null -ne $temp -and $null -ne $rh) {
+        $cWord = 'comfortable'
+        if ($temp -ge 29) { $cWord = 'hot'; $cState = 'caution' }
+        elseif ($temp -gt 26) { $cWord = 'a little warm'; $cState = 'caution' }
+        elseif ($temp -lt 16) { $cWord = 'cold'; $cState = 'caution' }
+        elseif ($temp -lt 18) { $cWord = 'a little cool'; $cState = 'caution' }
+        elseif ($rh -gt 65 -or ($null -ne $dew -and $dew -ge 19)) { $cWord = 'a little humid'; $cState = 'caution' }
+        elseif ($rh -lt 30) { $cWord = 'a little dry'; $cState = 'caution' }
+    }
+    $state = 'good'; if ($airState -eq 'caution' -or $cState -eq 'caution') { $state = 'caution' }; if ($airState -eq 'alert') { $state = 'alert' }
+    $line = ''
+    if ($airWord -and $cWord) { $line = "$airWord and $cWord." }
+    elseif ($airWord) { $line = "$airWord." }
+    elseif ($cWord) { $line = $cWord.Substring(0,1).ToUpper() + $cWord.Substring(1) + '.' }
+    $op = ''
+    if ($occ.Level -eq 0) { if (-not $occ.Low) { $op = 'Nobody in.' } }
+    elseif ($occ.Level -eq 1) { $op = 'One or two people.' }
+    elseif ($occ.Level -eq 2) { $op = 'Several people.' }
+    elseif ($occ.Level -eq 3) { $op = 'A crowd.' }
+    if ($op) { $line = ($line + ' ' + $op).Trim() }
+    if (-not $line) { $line = 'Waiting for sensors.' }
+    return @{ Line = $line; State = $state }
+}
+function Rs-SetTargets($map, [bool]$animate) {
+    foreach ($k in @($map.Keys)) {
+        $script:rsTarget[$k] = $map[$k]
+        if (-not $animate -or -not $script:rsDisp.ContainsKey($k) -or $null -eq $map[$k] -or $null -eq $script:rsDisp[$k]) { $script:rsDisp[$k] = $map[$k] }
+    }
+}
+function Rs-AnimStep {
+    $moving = $false
+    foreach ($k in @($script:rsTarget.Keys)) {
+        $t = $script:rsTarget[$k]
+        if ($null -eq $t) { $script:rsDisp[$k] = $null; continue }
+        $d = $script:rsDisp[$k]
+        if ($null -eq $d) { $script:rsDisp[$k] = $t; continue }
+        $diff = $t - $d
+        if ([Math]::Abs($diff) -lt 0.05) { $script:rsDisp[$k] = $t } else { $script:rsDisp[$k] = $d + $diff * 0.25; $moving = $true }
+    }
+    return $moving
+}
+function Rs-Fmt($key, $fmt) {
+    $v = $script:rsTarget[$key]
+    if ($script:rsDisp.ContainsKey($key) -and $null -ne $script:rsDisp[$key]) { $v = $script:rsDisp[$key] }
+    if ($null -eq $v) { return [string]$script:RsEm }
+    return ($fmt -f [double]$v)
 }
 
-# ---- Trends chart (temperature + humidity + dewpoint) ---------------------
-function Get-Dewpoint {
-    param([double]$T, [double]$RH)
-    if ($RH -le 0) { return [double]::NaN }
-    $a = 17.62; $b = 243.12
-    $g = [math]::Log($RH/100.0) + ($a*$T)/($b+$T)
-    return ($b*$g)/($a-$g)
-}
-function Get-SensorSeries {
-    $list = New-Object System.Collections.Generic.List[object]
-    if (-not (Test-Path $CsvPath)) { return $list }
-    try {
-        foreach ($r in (Import-Csv $CsvPath)) {
-            $t = [datetime]::MinValue
-            if (-not [datetime]::TryParse($r.timestamp, [ref]$t)) { continue }
-            $tc = 0.0; if (-not [double]::TryParse($r.tempC, [ref]$tc)) { continue }
-            $hu = 0.0; [void][double]::TryParse($r.humidity, [ref]$hu)
-            $list.Add([pscustomobject]@{ T=$t; TempC=$tc; Hum=$hu; Dew=[math]::Round((Get-Dewpoint $tc $hu),1) })
+function Update-State {
+    $now = Get-Date
+    $r = $script:lastReading; $a = $script:lastAranet
+    $Clk = [Vulcan.Data]::Clock; $Air = [Vulcan.Data]::Air
+    $clockAge = $null; if ($r) { $clockAge = ($now - $r.When).TotalMinutes }
+    $airAge = $null;   if ($a) { $airAge = ($now - $a.When).TotalMinutes }
+    $airIvl = 2.0;     if ($a -and $a.Interval -gt 0) { $airIvl = $a.Interval / 60.0 }
+    $clockStale = ($null -eq $clockAge) -or ($clockAge -gt [Math]::Max(3 * (Clock-Interval), 20))
+    $airStale   = ($null -eq $airAge) -or ($airAge -gt [Math]::Max(12, 4 * $airIvl))
+    # Temperature and humidity come from the clock; if the clock has gone quiet the
+    # Aranet's own sensor fills in, so the dashboard keeps working on one device.
+    $src = $null
+    if ($r -and -not $clockStale) { $src = 'clock' }
+    elseif ($a -and -not $airStale -and $null -ne (NVal $a.TempC)) { $src = 'aranet' }
+    elseif ($r) { $src = 'clock' }
+    elseif ($a -and $null -ne (NVal $a.TempC)) { $src = 'aranet' }
+    $temp = $null; $hum = $null; $envStale = $true; $envAge = $null; $envTbl = $Clk; $tCol = 0; $hCol = 1
+    if ($src -eq 'clock') { $temp = [double]$r.TempC; $hum = [double]$r.Humidity; $envStale = $clockStale; $envAge = $clockAge }
+    elseif ($src -eq 'aranet') { $temp = NVal $a.TempC; $hum = NVal $a.Hum; $envStale = $airStale; $envAge = $airAge; $envTbl = $Air; $tCol = 1; $hCol = 2 }
+    $co2 = $null; $pres = $null
+    if ($a) { $co2 = [double]$a.Co2; $pres = NVal $a.Pres }
+    $dew = $null; $abs = $null
+    if ($null -ne $temp -and $null -ne $hum -and $hum -gt 0) {
+        $dew = [Math]::Round([Vulcan.Model]::DewPoint($temp, $hum), 1); $abs = [Math]::Round([Vulcan.Model]::AbsHum($temp, $hum), 1)
+    }
+    $M = [Vulcan.Model]::Evaluate($now, [double]$script:settings.RoomVolume)
+
+    # occupancy (a band, never a count)
+    $lvl = $null; if (-not $airStale -and $M.OccLevel -ge 0) { $lvl = [int]$M.OccLevel }
+    $band = 'Waiting for sensor'
+    if ($null -ne $lvl) { $band = @('Empty', ('1' + $script:RsNd + '2 people'), 'Several people', 'A crowd')[$lvl] }
+    $hr = $now.Hour
+    $occ = @{ Level = $lvl; Band = $band; Held = [bool]$M.OccHeld; Low = [bool]$M.OccLowSignal; Night = ($hr -ge 23 -or $hr -lt 6); Volume = [int]$script:settings.RoomVolume }
+
+    # ventilation: a decay in progress is a live measurement; otherwise this room's usual rate
+    $achShown = $null; $achKind = 'none'
+    if ($M.AchLive) { $achShown = $M.AchLiveK; $achKind = 'live' }
+    elseif (-not [double]::IsNaN($M.AchTypical)) { $achShown = $M.AchTypical; $achKind = 'typical' }
+    elseif (-not [double]::IsNaN($M.AchLast)) { $achShown = $M.AchLast; $achKind = 'last' }
+    $ab = Rs-AchBand $achShown
+    $airing = ($M.AchLive -and $M.AchLiveK -gt 1.5 * $M.AchClosed)
+
+    # pressure tendency, in the Met Office's words
+    $pRate = NVal $M.PresRate3h; $pTrend = 'Gathering data'; $pDir = 0; $pNote = 'Needs about an hour of readings.'
+    if ($null -ne $pRate) {
+        $ar = [Math]::Abs($pRate); $w = 'Rising'; $pDir = 1
+        if ($pRate -lt 0) { $w = 'Falling'; $pDir = -1 }
+        if ($ar -lt 0.5) { $pTrend = 'Steady'; $pDir = 0; $pNote = 'Little change expected.' }
+        elseif ($ar -lt 1.6) { $pTrend = "$w slowly"; $pNote = 'Slowly settling.'; if ($pRate -lt 0) { $pNote = 'Conditions may slowly turn.' } }
+        elseif ($ar -lt 3.6) { $pTrend = $w; $pNote = 'Clearing and settling.'; if ($pRate -lt 0) { $pNote = 'Unsettled weather is more likely.' } }
+        else { $pTrend = "$w quickly"; $pNote = 'Clearing fast; it may turn windy.'; if ($pRate -lt 0) { $pNote = 'A front or storm may be approaching.' } }
+    }
+
+    $vd = Rs-Verdict $co2 $airStale $temp $hum $dew $occ $M
+    $h6 = $now.AddHours(-6)
+    $tD = Rs-Delta1h $envTbl $tCol $temp $now; if ($null -ne $tD) { $tD = [Math]::Round($tD, 1) }
+    $hD = Rs-Delta1h $envTbl $hCol $hum $now;  if ($null -ne $hD) { $hD = [Math]::Round($hD, 0) }
+    $cD = Rs-Delta1h $Air 0 $co2 $now;           if ($null -ne $cD) { $cD = [Math]::Round($cD, 0) }
+    $pD = Rs-Delta1h $Air 3 $pres $now;          if ($null -ne $pD) { $pD = [Math]::Round($pD, 1) }
+    $envNote = ''; if ($src -eq 'aranet') { $envNote = 'via Aranet4' }
+    $envAgeTxt = ''; if ($null -ne $envAge) { $envAgeTxt = Rs-AgeText $envAge }
+    $airAgeTxt = ''; if ($null -ne $airAge) { $airAgeTxt = Rs-AgeText $airAge }
+
+    $oldLine = ''; $oldState = 'good'
+    if ($script:rs) { $oldLine = $script:rs.Verdict; $oldState = $script:rs.State }
+    $dashOpen = [bool]($script:dash -and $script:dash.Form -and -not $script:dash.Form.IsDisposed)
+    $animate = ($dashOpen -and -not $script:rsReduced)
+    Rs-SetTargets @{ co2 = $co2; v_temp = $temp; v_hum = $hum; v_co2 = $co2; v_pres = $pres; dew = $dew } $animate
+
+    $script:rs = @{
+        Updated = $now; M = $M
+        Temp = $temp; Hum = $hum; Co2 = $co2; Pres = $pres; Dew = $dew; Abs = $abs
+        EnvSrc = $src; EnvStale = $envStale; Co2Stale = $airStale; Co2Age = $airAgeTxt
+        Occ = $occ
+        Ach = $achShown; AchKind = $achKind; AchBand = $ab.Band; AchLevel = $ab.Level; Airing = $airing
+        PresRate = $pRate; PresTrend = $pTrend; PresDir = $pDir; PresNote = $pNote
+        Verdict = $vd.Line; State = $vd.State
+        Rebreathed = $(if ($null -ne $co2) { [Math]::Round([Vulcan.Model]::Rebreathed($co2, $M.Baseline), 1) } else { $null })
+        AirIntervalMin = $airIvl
+        ClockWhen = $(if ($r) { $r.When } else { $null }); AranetWhen = $(if ($a) { $a.When } else { $null })
+        ClockBatt = $(if ($r) { NVal $r.Battery } else { $null }); AranetBatt = $(if ($a) { NVal $a.Battery } else { $null })
+        Alerts = @(); AlertLevel = 'good'
+        V = @{
+            temp = @{ Label='Temperature'; Raw=$temp; DispKey='v_temp'; Fmt='{0:0.0}'; Unit=($script:RsDeg+'C'); Icon='temp'; Spark=$envTbl.Spark($tCol,$h6,$now,36); Delta=$tD; DFmt='{0:0.0}'; DUnit=$script:RsDeg; Stale=$envStale; AgeText=$envAgeTxt; Hot=($null -ne $tD -and [Math]::Abs($tD) -ge 1.5); Note=$envNote }
+            hum  = @{ Label='Humidity';    Raw=$hum;  DispKey='v_hum';  Fmt='{0:0}';   Unit='%';   Icon='drop';  Spark=$envTbl.Spark($hCol,$h6,$now,36); Delta=$hD; DFmt='{0:0}'; DUnit='%'; Stale=$envStale; AgeText=$envAgeTxt; Hot=($null -ne $hD -and [Math]::Abs($hD) -ge 8); Note=$envNote }
+            co2  = @{ Label=('CO'+$script:RsSub2); Raw=$co2; DispKey='v_co2'; Fmt='{0:0}'; Unit='ppm'; Icon='air';   Spark=$Air.Spark(0,$h6,$now,36); Delta=$cD; DFmt='{0:0}'; DUnit=' ppm'; Stale=$airStale; AgeText=$airAgeTxt; Hot=($null -ne $cD -and $cD -ge 200); Note='' }
+            pres = @{ Label='Pressure';    Raw=$pres; DispKey='v_pres'; Fmt='{0:0}';   Unit='hPa'; Icon='gauge'; Spark=$Air.Spark(3,$h6,$now,36); Delta=$pD; DFmt='{0:0.0}'; DUnit=' hPa'; Stale=$airStale; AgeText=$airAgeTxt; Hot=($null -ne $pD -and [Math]::Abs($pD) -ge 2.5); Note='' }
         }
-    } catch { WLog "WARN csv read failed: $($_.Exception.Message)" }
-    return $list
+    }
+    Update-Alerts
+    if ($script:rs.AlertLevel -eq 'alert') { $script:rs.State = 'alert' }
+    elseif ($script:rs.AlertLevel -eq 'caution' -and $script:rs.State -eq 'good') { $script:rs.State = 'caution' }
+    if ($vd.Line -ne $oldLine) { $script:rsPrevVerdict = $oldLine; $script:rsVAlpha = 1.0; if ($animate -and $oldLine) { $script:rsVAlpha = 0.0 } }
+    if ($script:rs.State -ne $oldState -and $animate) { $script:rsSettle['aq'] = 1.0 }
 }
-function Get-AranetSeries {
-    $list = New-Object System.Collections.Generic.List[object]
-    if (-not (Test-Path $AranetCsv)) { return $list }
-    try {
-        foreach ($r in (Import-Csv $AranetCsv)) {
-            $t = [datetime]::MinValue
-            if (-not [datetime]::TryParse($r.timestamp, [ref]$t)) { continue }
-            $co2 = 0.0; if (-not [double]::TryParse($r.co2, [ref]$co2)) { continue }
-            $pr = 0.0; [void][double]::TryParse($r.pressure, [ref]$pr)
-            $list.Add([pscustomobject]@{ T=$t; Co2=[int]$co2; Pres=$pr })
+
+# ---------------------------------------------------------------------------
+#  Alerts: a short list of things worth interrupting for. Each has hysteresis
+#  (so it does not flap at the threshold), a hold time (so a blip is ignored)
+#  and a re-notify interval (so it does not nag).
+# ---------------------------------------------------------------------------
+function Update-Alerts {
+    $rs = $script:rs; $now = $rs.Updated; $want = [ordered]@{}
+    $S = $script:settings
+    $def = { param($key, $level, $title, $msg, $hold, $renotify) $want[$key] = @{ Key=$key; Level=$level; Title=$title; Msg=$msg; Hold=$hold; Renotify=$renotify } }
+    $co2Name = 'CO' + $script:RsSub2
+
+    if ($null -ne $rs.Co2 -and -not $rs.Co2Stale) {
+        $c = $rs.Co2; $prev = $script:alerts['co2']
+        if ($c -ge 1400 -or ($prev -and $c -ge 1200)) {
+            if ($c -ge 2000 -or ($prev -and $prev.Level -eq 'alert' -and $c -ge 1800)) { & $def 'co2' 'alert' "$co2Name is very high" ('{0:0} ppm. Open a window or door now.' -f $c) 2 30 }
+            else { & $def 'co2' 'caution' "$co2Name is high" ('{0:0} ppm. Open a window or door.' -f $c) 3 45 }
         }
-    } catch { WLog "WARN aranet csv read failed: $($_.Exception.Message)" }
-    return $list
+    }
+    if ($null -ne $rs.Hum -and -not $rs.EnvStale) {
+        $h = $rs.Hum
+        if ($h -ge 70 -or ($script:alerts['humid'] -and $h -ge 66)) { & $def 'humid' 'caution' 'Humidity is high' ('{0:0}% RH. Mould becomes likely if it stays above 70%.' -f $h) 30 240 }
+        if ($h -le 25 -or ($script:alerts['dry'] -and $h -le 28)) { & $def 'dry' 'caution' 'Air is very dry' ('{0:0}% RH.' -f $h) 30 240 }
+    }
+    if ($null -ne $rs.Temp -and -not $rs.EnvStale) {
+        $t = $rs.Temp
+        if ($t -ge 30 -or ($script:alerts['hot'] -and $t -ge 29)) { & $def 'hot' 'caution' 'Room is hot' ('{0:0.0}{1}C.' -f $t, $script:RsDeg) 15 240 }
+        if ($t -le 12 -or ($script:alerts['cold'] -and $t -le 13)) { & $def 'cold' 'caution' 'Room is cold' ('{0:0.0}{1}C.' -f $t, $script:RsDeg) 15 240 }
+    }
+    # A device going quiet. Bluetooth reception thins out while the PC is locked, and
+    # short silences are routine (this Aranet skips 15+ minutes a few times a day),
+    # so: only count time while someone is at the PC, and wait well past the routine.
+    if ($S.ConnectionEnabled -and -not $script:sessionLocked) {
+        $since0 = $script:startedAt; if ($script:unlockedAt -gt $since0) { $since0 = $script:unlockedAt }
+        if ($S.AranetEnabled) {
+            $heard = $since0; if ($script:lastAranet -and $script:lastAranet.Captured -gt $heard) { $heard = $script:lastAranet.Captured }
+            $quiet = ($now - $heard).TotalMinutes
+            if ($quiet -ge [Math]::Max(45, 10 * $rs.AirIntervalMin)) { & $def 'air-off' 'caution' 'Aranet4 is quiet' ('No broadcast for {0}. Check it is in range and Smart Home integration is on.' -f (Rs-AgeText $quiet).Replace(' ago','')) 0 360 }
+        }
+        $read = $since0; if ($script:lastReading -and $script:lastReading.When -gt $read) { $read = $script:lastReading.When }
+        $since = ($now - $read).TotalMinutes
+        if ($since -ge [Math]::Max(3 * (Clock-Interval) + 5, 60)) { & $def 'clock-off' 'caution' 'Clock not reached' ('No reading for {0}. It may be out of range or need batteries.' -f (Rs-AgeText $since).Replace(' ago','')) 0 360 }
+    }
+    if ($null -ne $rs.ClockBatt -and ($rs.ClockBatt -le 10 -or ($script:alerts['batt-clock'] -and $rs.ClockBatt -le 15))) { & $def 'batt-clock' 'caution' 'Clock battery low' ('{0:0}% left.' -f $rs.ClockBatt) 0 1440 }
+    if ($null -ne $rs.AranetBatt -and ($rs.AranetBatt -le 15 -or ($script:alerts['batt-air'] -and $rs.AranetBatt -le 20))) { & $def 'batt-air' 'caution' 'Aranet4 battery low' ('{0:0}% left.' -f $rs.AranetBatt) 0 1440 }
+    if ($null -ne $rs.PresRate -and ($rs.PresRate -le -3.6 -or ($script:alerts['pressure'] -and $rs.PresRate -le -3.0))) { & $def 'pressure' 'info' 'Pressure dropping fast' ('{0:0.0} hPa in 3 h. Weather is likely turning.' -f [Math]::Abs($rs.PresRate)) 10 720 }
+
+    foreach ($k in @($script:alerts.Keys)) { if (-not $want.Contains($k)) { $script:alerts.Remove($k) } }
+    foreach ($k in $want.Keys) {
+        $w = $want[$k]; $cur = $script:alerts[$k]
+        if (-not $cur) { $w.Since = $now; $w.Notified = $null; $script:alerts[$k] = $w; $cur = $w }
+        else {
+            if ($w.Level -eq 'alert' -and $cur.Level -ne 'alert') { $cur.Notified = $null }   # escalation: speak up again
+            $cur.Level = $w.Level; $cur.Title = $w.Title; $cur.Msg = $w.Msg; $cur.Renotify = $w.Renotify
+        }
+        $cur.Visible = (($now - $cur.Since).TotalMinutes -ge $cur.Hold)
+        if ($cur.Visible -and $cur.Level -ne 'info' -and ($null -eq $cur.Notified -or ($now - $cur.Notified).TotalMinutes -ge $cur.Renotify)) {
+            if (Alert-Notify $cur) { $cur.Notified = $now }
+        }
+    }
+    $rank = @{ alert = 0; caution = 1; info = 2 }
+    $vis = @($script:alerts.Values | Where-Object { $_.Visible } | Sort-Object { $rank[$_.Level] })
+    $rs.Alerts = $vis
+    $lv = 'good'
+    foreach ($x in $vis) { if ($x.Level -eq 'alert') { $lv = 'alert' } elseif ($x.Level -eq 'caution' -and $lv -eq 'good') { $lv = 'caution' } }
+    $rs.AlertLevel = $lv
 }
-# Display labels <-> internal codes for the time-range filter.
-$script:RangeMap = [ordered]@{
-    'Last hour'      = '1h'
-    'Last 6 hours'   = '6h'
-    'Last 24 hours'  = '24h'
-    'Last 7 days'    = '7d'
-    'Last 30 days'   = '30d'
-    'All'            = 'all'
-    'Custom range...'= 'custom'
+function Alert-Notify($al) {
+    if ($SelfTest) { return $true }
+    if (-not $script:settings.AlertsEnabled) { return $true }
+    if ($script:sessionLocked) { return $false }      # nobody is at the PC: say it when they are back, if it is still true
+    $h = (Get-Date).Hour
+    if ($script:settings.QuietNight -and ($h -ge 22 -or $h -lt 7)) { return $false }   # hold it until morning if it is still true
+    $kind = 'warn'; if ($al.Level -eq 'alert') { $kind = 'alert' }
+    Rs-Toast $al.Title $al.Msg $kind $true
+    WLog "ALERT [$($al.Level)] $($al.Title): $($al.Msg)"
+    return $true
 }
+
+# Read feedback and alerts: inside the dashboard when it is the window in front,
+# otherwise a normal Windows notification from the tray icon.
+function Rs-Toast($title, $msg, $kind, [bool]$preferBalloon = $false) {
+    $dashOpen = [bool]($script:dash -and $script:dash.Form -and -not $script:dash.Form.IsDisposed)
+    $inWindow = $dashOpen
+    if ($dashOpen -and $preferBalloon) { $inWindow = ([System.Windows.Forms.Form]::ActiveForm -eq $script:dash.Form) }
+    if ($inWindow) {
+        $script:toast = @{ Title = [string]$title; Msg = [string]$msg; Kind = [string]$kind }
+        try { $script:dash.Status.Invalidate() } catch {}
+        if ($script:toastTimer) { $script:toastTimer.Stop(); $script:toastTimer.Start() }
+    } elseif ($script:ni -and -not $SelfTest) {
+        $icon = [System.Windows.Forms.ToolTipIcon]::Info
+        if ($kind -ne 'info') { $icon = [System.Windows.Forms.ToolTipIcon]::Warning }
+        try { $script:ni.ShowBalloonTip(5000, [string]$title, [string]$msg, $icon) } catch {}
+    }
+}
+
+function Refresh-Views {
+    $rs = $script:rs; if (-not $rs) { return }
+    $txt = '..'; if ($null -ne $rs.Temp) { $txt = [string][Math]::Round($rs.Temp) }
+    try { Update-Icon $txt (-not $script:settings.ConnectionEnabled) $rs.AlertLevel } catch {}
+    Set-Tooltip
+    try { $miReading.Text = Reading-Text } catch {}
+    if ($script:popupShown) { try { $script:popupPanel.Invalidate() } catch {} }
+    if ($script:dash -and $script:dash.Form -and -not $script:dash.Form.IsDisposed) {
+        $d = $script:dash
+        try { $d.Orb.SetTone((Rs-StateColor $rs.State)); $d.Verdict.AccessibleDescription = $rs.Verdict } catch {}
+        $want = 0; if ($rs.Alerts.Count -gt 0) { $want = 46 }
+        if ($d.Layout.RowStyles[1].Height -ne $want) { $d.Layout.RowStyles[1].Height = $want }
+        foreach ($pnl in $d.Panels) { if ($pnl -and -not $pnl.IsDisposed) { $pnl.Invalidate() } }
+        if ($script:RsAnimTimer -and -not $script:rsReduced) { $script:RsAnimTimer.Start() }
+    }
+}
+function Refresh-All { try { Update-State; Refresh-Views } catch { WLog "ERROR refresh: $($_.Exception.Message) :: $($_.ScriptStackTrace)" } }
+
+# ===========================================================================
+#  Devices
+# ===========================================================================
+$script:jobs = New-Object System.Collections.ArrayList
+function Job-Active([string]$device) { foreach ($j in $script:jobs) { if ($j.Device -eq $device) { return $true } }; return $false }
+
+# ---- Clock (LYWSD02): one short child process per read / time-sync ----
+function Start-Bg {
+    param([ValidateSet('read','sync')] [string]$Kind, [bool]$LogCsv, [bool]$Notify)
+    if (-not $script:settings.ConnectionEnabled) { if ($Notify) { Rs-Toast 'LYWSD02' 'Bluetooth is off. Turn the connection on in Settings to reach the clock.' 'warn' }; return }
+    if (Job-Active 'clock') { if ($Notify) { Rs-Toast 'LYWSD02' 'Already talking to the clock...' 'info' }; return }
+    $tmp = [System.IO.Path]::GetTempFileName()
+    $common = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$SyncScript`" -Json -NoToggle -DeviceName `"$($script:settings.DeviceName)`" -ScanSeconds $([int]$script:settings.ScanSeconds)"
+    if ($script:settings.Address) { $common += " -Address `"$($script:settings.Address)`"" }
+    if ($Kind -eq 'read') { $common += ' -ReadSensors' }
+    try { [void]$script:pauseEvt.Set() } catch {}     # the Aranet listener yields the radio (it keeps running)
+    try {
+        $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $common -WindowStyle Hidden -PassThru -RedirectStandardOutput $tmp
+        [void]$script:jobs.Add(@{ Proc=$p; Out=$tmp; Device='clock'; Kind=$Kind; LogCsv=$LogCsv; Notify=$Notify; Started=(Get-Date) })
+        if (-not $script:lastReading) { Update-Icon '..' $false 'good' }
+        $script:poll.Start(); Refresh-Menu
+        if ($script:dash -and $script:dash.Status) { try { $script:dash.Status.Invalidate() } catch {} }
+    } catch {
+        WLog "ERROR launching clock $Kind : $($_.Exception.Message)"
+        try { [void]$script:pauseEvt.Reset() } catch {}
+        Remove-Item $tmp -ErrorAction SilentlyContinue
+    }
+}
+function Read-JobJson($j) {
+    $raw = ''
+    try { $raw = Get-Content $j.Out -Raw -ErrorAction SilentlyContinue } catch {}
+    Remove-Item $j.Out -ErrorAction SilentlyContinue
+    $line = ($raw -split "`r?`n" | Where-Object { $_ -match '^\s*\{' } | Select-Object -First 1)
+    if ($line) { try { return ($line | ConvertFrom-Json) } catch {} }
+    return $null
+}
+function Complete-Clock($j, $data) {
+    if (-not ($data -and $data.ok)) {
+        if ($j.Notify) {
+            $msg = 'Could not reach the clock (not seen, or out of range).'
+            if ($j.Kind -eq 'sync') { $msg = 'Time sync failed: the clock was not seen. Press a button on it and try again.' }
+            Rs-Toast 'LYWSD02' $msg 'warn'
+        }
+        WLog "WARN clock $($j.Kind) failed"
+        return
+    }
+    if ($data.addr -and $data.addr -ne $script:settings.Address) {
+        WLog "INFO learned/updated address: $($data.addr)"
+        $script:settings.Address = $data.addr; Save-Settings
+    }
+    # A time sync returns no sensor values - only a read does.
+    if ($null -ne $data.tempC) {
+        $tc = [double]$data.tempC; $hu = [int]$data.humidity; $bat = $data.battery; $when = Get-Date
+        $script:lastReading = @{ TempC = $tc; Humidity = $hu; Battery = $bat; When = $when }
+        [Vulcan.Data]::AddClock($when, $tc, $hu, (NNum $bat), [bool]$j.LogCsv)
+        if ($j.Notify) {
+            $batTxt = '?'; if ($null -ne $bat) { $batTxt = "$bat%" }
+            Rs-Toast 'LYWSD02' ("{0:0.0}{1}C   {2}% RH   battery {3}" -f $tc, $script:RsDeg, $hu, $batTxt) 'info'
+        }
+    }
+    if ($j.Kind -eq 'sync') { WLog 'INFO clock synced'; if ($j.Notify) { Rs-Toast 'LYWSD02' 'Clock time synchronised.' 'info' } }
+}
+function Poll-Jobs {
+    if ($script:jobs.Count -eq 0) { $script:poll.Stop(); return }
+    foreach ($j in @($script:jobs)) {      # a hung scan must not hold the radio for ever
+        if (-not $j.Proc.HasExited -and ((Get-Date) - $j.Started).TotalSeconds -gt 300) { try { $j.Proc.Kill() } catch {}; WLog 'WARN clock job timed out; killed' }
+    }
+    $done = @($script:jobs | Where-Object { $_.Proc.HasExited })
+    foreach ($j in $done) {
+        $script:jobs.Remove($j)
+        try { Complete-Clock $j (Read-JobJson $j) } catch { WLog "ERROR clock result: $($_.Exception.Message)" }
+    }
+    if ($done.Count -gt 0) {
+        if (-not (Job-Active 'clock')) { try { [void]$script:pauseEvt.Reset() } catch {} }   # radio is free: the listener resumes
+        Refresh-All; Refresh-Menu
+    }
+    if ($script:jobs.Count -eq 0) { $script:poll.Stop() }
+}
+
+# ---- Aranet4: one persistent listener process; the widget just reads its file ----
+$script:watchProc = $null; $script:watchStartedAt = [datetime]::MinValue; $script:latestStamp = [datetime]::MinValue
+function Test-WatcherAlive {
+    $m = $null
+    try { if ([System.Threading.Mutex]::TryOpenExisting('LYWSD02_Aranet_Watcher_Mutex', [ref]$m)) { $m.Dispose(); return $true } } catch {}
+    return $false
+}
+function Stop-AranetWatcher {
+    try { if ($script:watchProc -and -not $script:watchProc.HasExited) { $script:watchProc.Kill() } } catch {}
+    $script:watchProc = $null
+    try {
+        if (Test-Path $WatchPidFile) {
+            $wp = [int](([System.IO.File]::ReadAllText($WatchPidFile)).Trim())
+            $p = Get-Process -Id $wp -ErrorAction SilentlyContinue
+            if ($p -and $p.ProcessName -eq 'powershell') { $p.Kill() }
+            Remove-Item $WatchPidFile -Force -ErrorAction SilentlyContinue
+        }
+    } catch {}
+}
+# A listener left behind by an older version of the widget has no pid file and does
+# not understand the pause signal. Find it the slow way - once, at startup only.
+function Stop-LegacyWatchers {
+    if (-not (Test-WatcherAlive) -or (Test-Path $WatchPidFile)) { return }
+    try {
+        $pat = '*-File*' + 'Watch-' + 'Aranet4.ps1*'
+        Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -like $pat -and $_.ProcessId -ne $PID } |
+            ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
+        WLog 'INFO replaced an older Aranet listener'
+    } catch {}
+}
+function Ensure-AranetWatcher {
+    if (-not $script:settings.ConnectionEnabled -or -not $script:settings.AranetEnabled) { return }
+    if (Test-WatcherAlive) { return }
+    if (((Get-Date) - $script:watchStartedAt).TotalSeconds -lt 20) { return }   # one is on its way up
+    try {
+        $script:watchProc = Start-Process -FilePath 'powershell.exe' -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$WatchScript`" -ParentPid $PID" -WindowStyle Hidden -PassThru
+        $script:watchStartedAt = Get-Date
+        WLog "INFO aranet listener started (pid $($script:watchProc.Id))"
+    } catch { WLog "ERROR launching aranet listener: $($_.Exception.Message)" }
+}
+function Read-AranetLatest {
+    try {
+        if (-not (Test-Path $LatestJson)) { return $null }
+        $d = [System.IO.File]::ReadAllText($LatestJson) | ConvertFrom-Json
+        if (-not ($d -and $d.ok)) { return $null }
+        $cap = [datetime]::ParseExact([string]$d.ts, 'yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture)
+        $age = -1; $ivl = 0
+        if ($null -ne $d.age) { $age = [int]$d.age }
+        if ($null -ne $d.interval -and [int]$d.interval -gt 0) { $ivl = [int]$d.interval }
+        $meas = $cap; if ($age -ge 0) { $meas = $cap.AddSeconds(-$age) }     # when the Aranet actually measured
+        return @{ Co2 = [int]$d.co2; TempC = [double]$d.tempC; Hum = [double]$d.humidity; Pres = [double]$d.pressure; Battery = $d.battery
+                  Status = [string]$d.status; When = $meas; Captured = $cap; Interval = $ivl; HasAge = ($age -ge 0) }
+    } catch { return $null }
+}
+# Pick up a new broadcast if there is one. Returns $true when the reading changed.
+function Sample-Aranet {
+    try { $stamp = [System.IO.File]::GetLastWriteTimeUtc($LatestJson) } catch { return $false }
+    if ($stamp -eq $script:latestStamp) { return $false }
+    $d = Read-AranetLatest
+    if (-not $d) { return $false }         # mid-write or unreadable: try again next tick
+    $script:latestStamp = $stamp
+    if (((Get-Date) - $d.Captured).TotalHours -gt 12) { return $false }
+    $script:lastAranet = $d
+    # One row per measurement: the Aranet repeats each measurement in several
+    # broadcasts, and its age field says when it was really taken.
+    $last = [Vulcan.Data]::Air.LastTime
+    $minGap = 55; if ($d.HasAge) { $minGap = 20 }
+    if (($d.When - $last).TotalSeconds -ge $minGap) {
+        [Vulcan.Data]::AddAir($d.When, $d.Co2, $d.TempC, $d.Hum, $d.Pres, (NNum $d.Battery), $d.Status, [bool]$script:settings.HourlyLogging)
+    }
+    return $true
+}
+function Aranet-Summary {
+    $a = $script:lastAranet; if (-not $a) { return 'No reading captured yet.' }
+    $age = [int]((Get-Date) - $a.When).TotalSeconds
+    $ageTxt = "measured $age s ago"; if ($age -ge 120) { $ageTxt = 'measured ' + (Rs-AgeText ($age/60.0)) }
+    $every = ''; if ($a.Interval -gt 0) { $every = "  $($script:RsMid)  measures every $([int]($a.Interval/60)) min" }
+    return ("{0} ppm   {1:0.0} hPa   {2}{3}" -f $a.Co2, $a.Pres, $ageTxt, $every)
+}
+# "Read now" for the Aranet. It measures on its own timer and cannot be commanded,
+# so the honest answer is the latest measurement and how old it is. Only if nothing
+# has been heard for a while do we wait for the next broadcast.
+function Force-Aranet {
+    if (-not $script:settings.ConnectionEnabled) { return }
+    if (-not $script:settings.AranetEnabled) { Rs-Toast 'Aranet4' 'Aranet tracking is off. Turn it on in Settings.' 'warn'; return }
+    Ensure-AranetWatcher
+    [void](Sample-Aranet)
+    $a = $script:lastAranet
+    $heard = 99999.0; if ($a) { $heard = ((Get-Date) - $a.Captured).TotalSeconds }
+    if ($heard -lt 150) { Refresh-All; Rs-Toast 'Aranet4' (Aranet-Summary) 'info'; return }
+    $script:aranetForce = @{ Stamp = $script:latestStamp; Deadline = (Get-Date).AddSeconds(90) }
+    Rs-Toast 'Aranet4' 'Listening for the next broadcast...' 'info'
+    $script:aranetForceTimer.Start()
+}
+function Aranet-ForceTick {
+    if (-not $script:aranetForce) { $script:aranetForceTimer.Stop(); return }
+    if (Sample-Aranet) {
+        $script:aranetForce = $null; $script:aranetForceTimer.Stop()
+        Refresh-All; Rs-Toast 'Aranet4' (Aranet-Summary) 'info'
+    } elseif ((Get-Date) -ge $script:aranetForce.Deadline) {
+        $script:aranetForce = $null; $script:aranetForceTimer.Stop()
+        Rs-Toast 'Aranet4' 'Nothing heard. Check it is in range and that Smart Home integration is on in the Aranet app.' 'warn'
+    }
+}
+function Read-Now { Start-Bg -Kind 'read' -LogCsv ([bool]$script:settings.HourlyLogging) -Notify $true; if ($script:settings.AranetEnabled) { Force-Aranet } }
+
+# ---- Scheduler: clock reads on their interval; Aranet broadcasts as they arrive ----
+function Scheduler-Tick {
+    $now = Get-Date; $changed = $false
+    $locked = [Vulcan.Native]::SessionLocked()
+    if ($script:sessionLocked -and -not $locked) { $script:unlockedAt = $now; $script:nextStateAt = $now }
+    $script:sessionLocked = $locked
+    if ($script:settings.ConnectionEnabled) {
+        if (-not (Job-Active 'clock') -and $now -ge $script:clockDue) {
+            $script:clockDue = $now.AddMinutes((Clock-Interval))
+            Start-Bg -Kind 'read' -LogCsv ([bool]$script:settings.HourlyLogging) -Notify $false
+        }
+        if ($script:settings.AranetEnabled) {
+            Ensure-AranetWatcher
+            if (-not $script:aranetForce -and (Sample-Aranet)) { $changed = $true }
+        }
+    }
+    if ($changed -or $now -ge $script:nextStateAt) { $script:nextStateAt = $now.AddSeconds(60); Refresh-All }
+    if ($now -ge $script:nextTrimAt) { $script:nextTrimAt = $now.AddHours(24); Trim-Logs }
+}
+function Trim-Logs {
+    foreach ($n in 'widget.log','sync.log','aranet.log') { try { [void][Vulcan.Files]::TrimLog((Join-Path $LogDir $n), 1MB, 256KB) } catch {} }
+}
+function Toggle-Connection {
+    $script:settings.ConnectionEnabled = -not $script:settings.ConnectionEnabled
+    Save-Settings
+    if ($script:settings.ConnectionEnabled) { $script:clockDue = Get-Date; Ensure-AranetWatcher; Scheduler-Tick }
+    else { Stop-AranetWatcher }
+    Refresh-Menu; Sync-DrawerControls; Refresh-All
+}
+function Toggle-Aranet {
+    $script:settings.AranetEnabled = -not $script:settings.AranetEnabled
+    Save-Settings
+    if ($script:settings.AranetEnabled) { Ensure-AranetWatcher } else { Stop-AranetWatcher }
+    Refresh-Menu; Sync-DrawerControls; Refresh-All
+}
+function Set-ClockInterval([int]$mins) {
+    $script:settings.IntervalMinutes = $mins
+    $next = (Get-Date).AddMinutes($mins)
+    if ($script:lastReading) { $next = $script:lastReading.When.AddMinutes($mins) }
+    $script:clockDue = $next
+    Save-Settings; Refresh-Menu; Sync-DrawerControls; Refresh-All
+}
+
+# ---- Startup shortcut ----
+$StartupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'LYWSD02 Widget.lnk'
+function Test-Startup { Test-Path $StartupLnk }
+function Set-Startup {
+    param([bool]$On)
+    if ($SelfTest) { return }
+    try {
+        if ($On) {
+            $wsh = New-Object -ComObject WScript.Shell
+            $sc = $wsh.CreateShortcut($StartupLnk)
+            $sc.TargetPath = Join-Path $ScriptDir 'Start-Widget.vbs'
+            $sc.WorkingDirectory = $ScriptDir
+            $sc.Description = 'LYWSD02 tray widget'
+            $sc.Save()
+        } elseif (Test-Path $StartupLnk) { Remove-Item $StartupLnk -Force }
+    } catch { WLog "WARN startup toggle failed: $($_.Exception.Message)" }
+}
+function Refresh-Menu {
+    $S = $script:settings
+    $miConn.Checked = [bool]$S.ConnectionEnabled
+    $miConn.Text = if ($S.ConnectionEnabled) { 'Bluetooth connection' } else { 'Bluetooth connection (off - battery saver)' }
+    $miLog.Checked = [bool]$S.HourlyLogging
+    $miAranet.Checked = [bool]$S.AranetEnabled
+    $miAlerts.Checked = [bool]$S.AlertsEnabled
+    $miStartup.Checked = (Test-Startup)
+    $busy = Job-Active 'clock'
+    $miRead.Enabled = (-not $busy) -and $S.ConnectionEnabled
+    $miSync.Enabled = (-not $busy) -and $S.ConnectionEnabled
+    $civl = Clock-Interval
+    $miClockIvl.Text = "Clock read interval ($civl min)"
+    foreach ($k in $script:miClockIvlItems.Keys) { $script:miClockIvlItems[$k].Checked = ($k -eq $civl) }
+}
+
+# ===========================================================================
+#  Hover popup: the room at a glance
+# ===========================================================================
+$script:popupShown = $false; $script:popupAnchor = New-Object System.Drawing.Point(0,0); $script:suppressUntil = 0
+function Rs-PaintPopup($g, $p) {
+    $T = $script:DashTheme; $F = $script:RsFonts; $Gx = [Vulcan.Gfx]
+    $Gx::Setup($g); $g.Clear($T.Canvas)
+    $Gx::Fill($g, $T.Surface, 0, 0, ($p.Width-1), ($p.Height-1), 14); $Gx::Stroke($g, $T.Hairline, 0, 0, ($p.Width-1), ($p.Height-1), 14)
+    $d = $script:rs
+    if (-not $d) { $Gx::Text($g, 'Waiting for sensors', $F.Body, $T.TextT, 18, 18); return }
+    $Gx::Dot($g, (Rs-StateColor $d.State), 16, 18, 11)
+    $Gx::TextBox($g, $d.Verdict, $F.Title, $T.TextP, 34, 11, ($p.Width-48), 24, $false)
+    $items = @(
+        @{ L = 'Temp';  V = $(if ($null -ne $d.Temp) { ('{0:0.0}' -f $d.Temp) + $script:RsDeg } else { [string]$script:RsEm }) },
+        @{ L = 'Humidity'; V = $(if ($null -ne $d.Hum) { "$([int]$d.Hum)%" } else { [string]$script:RsEm }) },
+        @{ L = ('CO' + $script:RsSub2 + ' ppm'); V = $(if ($null -ne $d.Co2) { "$([int]$d.Co2)" } else { [string]$script:RsEm }) },
+        @{ L = 'hPa'; V = $(if ($null -ne $d.Pres) { '{0:0}' -f $d.Pres } else { [string]$script:RsEm }) })
+    $cw = ($p.Width-32)/4.0; $x = 16; $y = 46
+    foreach ($it in $items) {
+        $Gx::Text($g, $it.L, $F.Caption, $T.TextT, $x, $y)
+        [void]$Gx::Num($g, $it.V, $F.Title, $T.TextP, $x, ($y+15))
+        $x += $cw
+    }
+    $sp = $d.V.co2.Spark
+    if ($sp -and $sp.Length -ge 2) { $Gx::Spark($g, $sp, 16, ($p.Height-52), ($p.Width-32), 26, $T.Accent, $T.AccentWash) }
+    if ($d.Alerts.Count -gt 0) {
+        $al = $d.Alerts[0]; $col = $T.Caution; if ($al.Level -eq 'alert') { $col = $T.Alert } elseif ($al.Level -eq 'info') { $col = $T.TextS }
+        $more = ''; if ($d.Alerts.Count -gt 1) { $more = "  (+$($d.Alerts.Count-1))" }
+        $Gx::TextBox($g, ($al.Title + $more), $F.Caption, $col, 16, ($p.Height-20), ($p.Width-32), 16, $false)
+    } else {
+        $Gx::Text($g, ('CO' + $script:RsSub2 + ', last 6 hours'), $F.Caption, $T.TextT, 16, ($p.Height-20))
+        $Gx::TextRight($g, 'click to open', $F.Caption, $T.TextT, 16, ($p.Height-20), ($p.Width-32))
+    }
+}
+function Show-Popup {
+    param([int]$cx,[int]$cy)
+    try {
+        Ensure-RsFonts
+        $script:popup.BackColor = $script:DashTheme.Canvas; $script:popupPanel.BackColor = $script:DashTheme.Canvas
+        $script:popupPanel.Invalidate()
+        $scr = [System.Windows.Forms.Screen]::FromPoint((New-Object System.Drawing.Point($cx,$cy))).WorkingArea
+        $w = $script:popup.Width; $h = $script:popup.Height
+        $x = [math]::Min([math]::Max([int]($cx - $w/2), $scr.Left), $scr.Right - $w)
+        $y = $cy - $h - 12; if ($y -lt $scr.Top) { $y = $cy + 24 }
+        $script:popup.Location = New-Object System.Drawing.Point([int]$x, [int]$y)
+        $script:popup.Show(); $script:popup.TopMost = $true
+        $script:popupShown = $true; $script:popupAnchor = New-Object System.Drawing.Point($cx, $cy)
+        $script:hide.Start()
+    } catch { WLog "WARN show-popup: $($_.Exception.Message)" }
+}
+function Hide-Popup {
+    if ($script:popupShown) { try { $script:popup.Hide() } catch {}; $script:popupShown = $false; $script:hide.Stop() }
+}
+
+# ===========================================================================
+#  Trends window (zoomable history)
+# ===========================================================================
+$script:RangeMap = [ordered]@{ 'Last hour'='1h'; 'Last 6 hours'='6h'; 'Last 24 hours'='24h'; 'Last 7 days'='7d'; 'Last 30 days'='30d'; 'All'='all'; 'Custom range...'='custom' }
+$script:trendForm = $null; $script:trendChart = $null; $script:trendCo2Chart = $null; $script:zoomBusy = $false
 function Get-RangeBounds {
     $code = $script:settings.TrendRange; if (-not $code) { $code = '7d' }
     $now = Get-Date
     switch ($code) {
-        '1h'  { @{ From=$now.AddHours(-1);  To=$now } }
-        '6h'  { @{ From=$now.AddHours(-6);  To=$now } }
-        '24h' { @{ From=$now.AddDays(-1);   To=$now } }
-        '7d'  { @{ From=$now.AddDays(-7);   To=$now } }
-        '30d' { @{ From=$now.AddDays(-30);  To=$now } }
-        'all' { @{ From=[datetime]'1900-01-01'; To=[datetime]'2999-01-01' } }
-        'custom' {
-            $f = if ($script:settings.TrendFrom) { [datetime]$script:settings.TrendFrom } else { $now.AddDays(-7) }
-            $t = if ($script:settings.TrendTo)   { [datetime]$script:settings.TrendTo }   else { $now }
-            @{ From=$f; To=$t }
+        '1h'  { return @{ From=$now.AddHours(-1);  To=$now } }
+        '6h'  { return @{ From=$now.AddHours(-6);  To=$now } }
+        '24h' { return @{ From=$now.AddDays(-1);   To=$now } }
+        '30d' { return @{ From=$now.AddDays(-30);  To=$now } }
+        'all' {
+            $f = $now.AddDays(-1)
+            foreach ($tb in @([Vulcan.Data]::Clock, [Vulcan.Data]::Air)) { if ($tb.Count -gt 0 -and $tb.Time(0) -lt $f) { $f = $tb.Time(0) } }
+            return @{ From=$f; To=$now }
         }
-        default { @{ From=$now.AddDays(-7); To=$now } }
+        'custom' {
+            $f = $now.AddDays(-7); $t = $now
+            try { if ($script:settings.TrendFrom) { $f = [datetime]$script:settings.TrendFrom } } catch {}
+            try { if ($script:settings.TrendTo)   { $t = [datetime]$script:settings.TrendTo } } catch {}
+            return @{ From=$f; To=$t }
+        }
+        default { return @{ From=$now.AddDays(-7); To=$now } }
     }
-}
-function Reading-Text {
-    $clock = 'LYWSD02: no reading yet'
-    if ($script:lastReading) {
-        $tc=[double]$script:lastReading.TempC; $hu=[int]$script:lastReading.Humidity; $bat=$script:lastReading.Battery
-        $dew=Get-Dewpoint $tc $hu
-        $batTxt = if ($null -eq $bat) {'?'} else {"$bat%"}
-        $clock = ("LYWSD02: {0:0.0}C  {1}% RH  dew {2:0.0}C  batt {3}" -f $tc,$hu,$dew,$batTxt)
-    }
-    $aranet = ''
-    if ($script:lastAranet) {
-        $aranet = ("   |   Aranet4: {0} ppm CO2 ({1})  {2:0.0}hPa" -f [int]$script:lastAranet.Co2, $script:lastAranet.Status, [double]$script:lastAranet.Pres)
-    }
-    return ($clock + $aranet)
 }
 function Style-ChartArea($chart, $area, $bg, $grid, $fg) {
     $chart.BackColor = $bg
@@ -250,613 +892,148 @@ function Style-ChartArea($chart, $area, $bg, $grid, $fg) {
         $ax.MajorGrid.LineColor = $grid
         $ax.MajorGrid.LineDashStyle = [System.Windows.Forms.DataVisualization.Charting.ChartDashStyle]::Dot
     }
-    $area.AxisX.MajorGrid.Enabled = $false   # no vertical grid - cleaner
+    $area.AxisX.MajorGrid.Enabled = $false
+    $area.AxisX.ScrollBar.BackColor = $bg; $area.AxisX.ScrollBar.ButtonColor = $grid; $area.AxisX.ScrollBar.LineColor = $grid
+    $area.AxisX.ScrollBar.Size = 10
+}
+function New-TrendSeries($chart, $name, $legend, $axis, $color, [bool]$dash, $tip) {
+    $s = New-Object System.Windows.Forms.DataVisualization.Charting.Series($name)
+    # Line, not Spline: a spline overshoots between unevenly spaced samples.
+    $s.ChartType = [System.Windows.Forms.DataVisualization.Charting.SeriesChartType]::Line
+    $s.XValueType = [System.Windows.Forms.DataVisualization.Charting.ChartValueType]::DateTime
+    $s.BorderWidth = 2; $s.Color = $color; $s.YAxisType = $axis; $s.LegendText = $legend; $s.ToolTip = $tip
+    $s.MarkerColor = $color
+    if ($dash) { $s.BorderDashStyle = [System.Windows.Forms.DataVisualization.Charting.ChartDashStyle]::Dash }
+    $chart.Series.Add($s)
+}
+function New-TrendBase($leftColor, $rightColor) {
+    $T = $script:DashTheme
+    $chart = New-Object System.Windows.Forms.DataVisualization.Charting.Chart
+    $area  = New-Object System.Windows.Forms.DataVisualization.Charting.ChartArea('main')
+    Style-ChartArea $chart $area $T.Surface ([System.Drawing.Color]::FromArgb(60, $T.TextT.R, $T.TextT.G, $T.TextT.B)) $T.TextS
+    $area.AxisX.IntervalType = [System.Windows.Forms.DataVisualization.Charting.DateTimeIntervalType]::Hours
+    $area.AxisY.LabelStyle.ForeColor = $leftColor; $area.AxisY.IsStartedFromZero = $false
+    $area.AxisY2.Enabled = [System.Windows.Forms.DataVisualization.Charting.AxisEnabled]::True
+    $area.AxisY2.IsStartedFromZero = $false; $area.AxisY2.LabelStyle.ForeColor = $rightColor; $area.AxisY2.MajorGrid.Enabled = $false
+    $chart.ChartAreas.Add($area)
+    $lg = New-Object System.Windows.Forms.DataVisualization.Charting.Legend('L')
+    $lg.BackColor = [System.Drawing.Color]::Transparent; $lg.ForeColor = $T.TextS
+    $lg.Docking = [System.Windows.Forms.DataVisualization.Charting.Docking]::Top
+    $lg.Font = New-Object System.Drawing.Font('Segoe UI', 8.5)
+    $chart.Legends.Add($lg)
+    $tt = New-Object System.Windows.Forms.DataVisualization.Charting.Title
+    $tt.ForeColor = $T.TextP; $tt.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 10)
+    $tt.Alignment = [System.Drawing.ContentAlignment]::TopLeft
+    $chart.Titles.Add($tt)
+    return $chart
 }
 function New-TrendChart {
-    param([bool]$Compact)
-    $deg   = [char]0x00B0
-    $bg    = [System.Drawing.Color]::FromArgb(18,19,24)
-    $grid  = [System.Drawing.Color]::FromArgb(42,44,52)
-    $fg    = [System.Drawing.Color]::FromArgb(165,172,188)
-    $cTemp = [System.Drawing.Color]::FromArgb(255,122,89)
-    $cDew  = [System.Drawing.Color]::FromArgb(86,180,239)
-    $cHum  = [System.Drawing.Color]::FromArgb(72,199,142)
-    $chart = New-Object System.Windows.Forms.DataVisualization.Charting.Chart
-    $area  = New-Object System.Windows.Forms.DataVisualization.Charting.ChartArea('main')
-    Style-ChartArea $chart $area $bg $grid $fg
-    $area.AxisX.IntervalType = [System.Windows.Forms.DataVisualization.Charting.DateTimeIntervalType]::Hours
-    $area.AxisY.LabelStyle.ForeColor = $cTemp; $area.AxisY.IsStartedFromZero = $false
-    $area.AxisY2.Enabled = [System.Windows.Forms.DataVisualization.Charting.AxisEnabled]::True
-    $area.AxisY2.IsStartedFromZero = $false; $area.AxisY2.LabelStyle.ForeColor = $cHum; $area.AxisY2.MajorGrid.Enabled = $false
-    $chart.ChartAreas.Add($area)
-    $P=[System.Windows.Forms.DataVisualization.Charting.AxisType]::Primary
-    $S=[System.Windows.Forms.DataVisualization.Charting.AxisType]::Secondary
-    $mk = {
-        param($name,$legend,$axis,$color,$dash,$tip)
-        $s = New-Object System.Windows.Forms.DataVisualization.Charting.Series($name)
-        # Line, not Spline: spline interpolation overshoots between unevenly-spaced
-        # samples, inventing curves and spikes that aren't in the data.
-        $s.ChartType = [System.Windows.Forms.DataVisualization.Charting.SeriesChartType]::Line
-        $s.XValueType = [System.Windows.Forms.DataVisualization.Charting.ChartValueType]::DateTime
-        $s.BorderWidth = if ($Compact) {2} else {3}; $s.Color = $color; $s.YAxisType = $axis; $s.LegendText = $legend
-        $s.ToolTip = $tip
-        # small markers so isolated/sparse points stay visible even where the
-        # line breaks across a gap (a bare Line draws nothing for a lone point).
-        $s.MarkerStyle = [System.Windows.Forms.DataVisualization.Charting.MarkerStyle]::Circle
-        $s.MarkerSize = if ($Compact) {2} else {3}; $s.MarkerColor = $color
-        if ($dash) { $s.BorderDashStyle = [System.Windows.Forms.DataVisualization.Charting.ChartDashStyle]::Dash }
-        $chart.Series.Add($s)
-    }
-    & $mk 'Humidity'    'Humidity (%)'              $S $cHum  $false "Humidity  #VALY{0}%  @ #VALX"
-    & $mk 'Temperature' "Temperature ($($deg)C)"    $P $cTemp $false "Temperature  #VALY{0.0}$($deg)C  @ #VALX"
-    & $mk 'Dew point'   "Dew point ($($deg)C)"      $P $cDew  $true  "Dew point  #VALY{0.0}$($deg)C  @ #VALX"
-    $lg = New-Object System.Windows.Forms.DataVisualization.Charting.Legend('L')
-    $lg.BackColor = [System.Drawing.Color]::Transparent; $lg.ForeColor = $fg
-    $lg.Docking = [System.Windows.Forms.DataVisualization.Charting.Docking]::Top
-    $lg.Font = New-Object System.Drawing.Font('Segoe UI', $(if ($Compact) {7} else {8.5}))
-    $chart.Legends.Add($lg)
+    $cTemp = [System.Drawing.Color]::FromArgb(255,122,89); $cDew = [System.Drawing.Color]::FromArgb(86,180,239); $cHum = [System.Drawing.Color]::FromArgb(72,199,142)
+    $chart = New-TrendBase $cTemp $cHum
+    $P = [System.Windows.Forms.DataVisualization.Charting.AxisType]::Primary; $S = [System.Windows.Forms.DataVisualization.Charting.AxisType]::Secondary
+    $deg = $script:RsDeg
+    New-TrendSeries $chart 'Humidity'    'Humidity (%)'           $S $cHum  $false "Humidity  #VALY{0}%  @ #VALX{ddd d MMM HH:mm}"
+    New-TrendSeries $chart 'Temperature' "Temperature ($($deg)C)" $P $cTemp $false "Temperature  #VALY{0.0}$($deg)C  @ #VALX{ddd d MMM HH:mm}"
+    New-TrendSeries $chart 'Dew point'   "Dew point ($($deg)C)"   $P $cDew  $true  "Dew point  #VALY{0.0}$($deg)C  @ #VALX{ddd d MMM HH:mm}"
     return $chart
 }
-# Add points to a series, inserting an empty point across gaps larger than
-# $gapMin so the line/area BREAKS instead of drawing a misleading connector
-# across hours/days when the widget wasn't logging.
-function Add-GapAware($series, $rows, [string]$vprop, [double]$gapMin) {
-    $prev = $null
-    foreach ($r in $rows) {
-        $t = $r.T
-        if ($null -ne $prev -and ($t - $prev).TotalMinutes -gt $gapMin) {
-            $i = $series.Points.AddXY($prev.AddSeconds(30), 0); $series.Points[$i].IsEmpty = $true
-        }
-        [void]$series.Points.AddXY($t, $r.$vprop)
-        $prev = $t
-    }
-}
-function Rebuild-ChartData {
-    param($chart, [string]$TitleText)
-    $b = Get-RangeBounds
-    $data = @(Get-SensorSeries | Where-Object { $_.T -ge $b.From -and $_.T -le $b.To })
-    $sT = $chart.Series['Temperature']; $sD = $chart.Series['Dew point']; $sH = $chart.Series['Humidity']
-    $sT.Points.Clear(); $sD.Points.Clear(); $sH.Points.Clear()
-    $gap = [Math]::Max(4 * (Clock-Interval), 120)   # only break across real outages (~2h+)
-    Add-GapAware $sH $data 'Hum'   $gap
-    Add-GapAware $sT $data 'TempC' $gap
-    Add-GapAware $sD $data 'Dew'   $gap
-    Update-Granularity $chart
-    if ($chart.Titles.Count -gt 0 -and $TitleText) { $chart.Titles[0].Text = $TitleText }
-}
-
-# ---- Air-quality chart (Aranet4: CO2 + pressure) --------------------------
 function New-Co2Chart {
-    param([bool]$Compact)
-    $bg    = [System.Drawing.Color]::FromArgb(18,19,24)
-    $grid  = [System.Drawing.Color]::FromArgb(42,44,52)
-    $fg    = [System.Drawing.Color]::FromArgb(165,172,188)
-    $cCo2  = [System.Drawing.Color]::FromArgb(232,176,64)
-    $cPres = [System.Drawing.Color]::FromArgb(167,139,238)
-    $chart = New-Object System.Windows.Forms.DataVisualization.Charting.Chart
-    $area  = New-Object System.Windows.Forms.DataVisualization.Charting.ChartArea('main')
-    Style-ChartArea $chart $area $bg $grid $fg
-    $area.AxisX.IntervalType = [System.Windows.Forms.DataVisualization.Charting.DateTimeIntervalType]::Hours
-    $area.AxisY.LabelStyle.ForeColor = $cCo2; $area.AxisY.IsStartedFromZero = $false
-    $area.AxisY2.Enabled = [System.Windows.Forms.DataVisualization.Charting.AxisEnabled]::True
-    $area.AxisY2.IsStartedFromZero = $false; $area.AxisY2.LabelStyle.ForeColor = $cPres; $area.AxisY2.MajorGrid.Enabled = $false
-    $chart.ChartAreas.Add($area)
-    $P=[System.Windows.Forms.DataVisualization.Charting.AxisType]::Primary
-    $S=[System.Windows.Forms.DataVisualization.Charting.AxisType]::Secondary
-    # Both as Line (not Spline/Area): Line never overshoots and breaks cleanly at
-    # gaps, whereas an Area wedges down to the axis floor across a gap and leaves a
-    # misleading faint fill where there is no data.
-    $sCo2 = New-Object System.Windows.Forms.DataVisualization.Charting.Series('CO2')
-    $sCo2.ChartType = [System.Windows.Forms.DataVisualization.Charting.SeriesChartType]::Line
-    $sCo2.XValueType = [System.Windows.Forms.DataVisualization.Charting.ChartValueType]::DateTime
-    $sCo2.YAxisType = $P; $sCo2.LegendText = 'CO2 (ppm)'
-    $sCo2.Color = $cCo2; $sCo2.BorderWidth = if ($Compact) {2} else {3}
-    $sCo2.MarkerStyle = [System.Windows.Forms.DataVisualization.Charting.MarkerStyle]::Circle
-    $sCo2.MarkerSize = if ($Compact) {2} else {3}; $sCo2.MarkerColor = $cCo2
-    $sCo2.ToolTip = "CO2  #VALY{0} ppm  @ #VALX"
-    $chart.Series.Add($sCo2)
-    $sPres = New-Object System.Windows.Forms.DataVisualization.Charting.Series('Pressure')
-    $sPres.ChartType = [System.Windows.Forms.DataVisualization.Charting.SeriesChartType]::Line
-    $sPres.XValueType = [System.Windows.Forms.DataVisualization.Charting.ChartValueType]::DateTime
-    $sPres.YAxisType = $S; $sPres.LegendText = 'Pressure (hPa)'
-    $sPres.Color = $cPres; $sPres.BorderWidth = if ($Compact) {2} else {3}
-    $sPres.MarkerStyle = [System.Windows.Forms.DataVisualization.Charting.MarkerStyle]::Circle
-    $sPres.MarkerSize = if ($Compact) {2} else {3}; $sPres.MarkerColor = $cPres
-    $sPres.ToolTip = "Pressure  #VALY{0.0} hPa  @ #VALX"
-    $chart.Series.Add($sPres)
-    $lg = New-Object System.Windows.Forms.DataVisualization.Charting.Legend('L')
-    $lg.BackColor = [System.Drawing.Color]::Transparent; $lg.ForeColor = $fg
-    $lg.Docking = [System.Windows.Forms.DataVisualization.Charting.Docking]::Top
-    $lg.Font = New-Object System.Drawing.Font('Segoe UI', $(if ($Compact) {7} else {8.5}))
-    $chart.Legends.Add($lg)
+    $cCo2 = [System.Drawing.Color]::FromArgb(232,176,64); $cPres = [System.Drawing.Color]::FromArgb(167,139,238)
+    $chart = New-TrendBase $cCo2 $cPres
+    $P = [System.Windows.Forms.DataVisualization.Charting.AxisType]::Primary; $S = [System.Windows.Forms.DataVisualization.Charting.AxisType]::Secondary
+    New-TrendSeries $chart 'CO2'      'CO2 (ppm)'      $P $cCo2  $false "CO2  #VALY{0} ppm  @ #VALX{ddd d MMM HH:mm}"
+    New-TrendSeries $chart 'Pressure' 'Pressure (hPa)' $S $cPres $false "Pressure  #VALY{0.0} hPa  @ #VALX{ddd d MMM HH:mm}"
     return $chart
 }
-function Rebuild-Co2Data {
-    param($chart, [string]$TitleText)
+# Fill one series from the in-memory history, thinned to what a chart can show.
+# A zoomed view (focus) is re-sampled at full detail.
+function Fill-Series($chart, [string]$name, $tbl, [int]$col, $b, $focus) {
+    $ff = [datetime]::MinValue; $ft = [datetime]::MinValue
+    if ($focus) { $ff = $focus.From; $ft = $focus.To }
+    $xy = $tbl.Sample($col, $b.From, $b.To, 2000, $ff, $ft, (2.0/24))
+    $s = $chart.Series[$name]
+    [Vulcan.ChartUtil]::Fill($s, $xy)
+    # markers keep lone points visible on sparse data; on dense data they only cost time
+    if ($xy.Count -le 400) { $s.MarkerStyle = [System.Windows.Forms.DataVisualization.Charting.MarkerStyle]::Circle; $s.MarkerSize = 4 }
+    else { $s.MarkerStyle = [System.Windows.Forms.DataVisualization.Charting.MarkerStyle]::None }
+}
+function Rebuild-Both($focus = $null) {
     $b = Get-RangeBounds
-    $data = @(Get-AranetSeries | Where-Object { $_.T -ge $b.From -and $_.T -le $b.To })
-    $sC = $chart.Series['CO2']; $sP = $chart.Series['Pressure']
-    $sC.Points.Clear(); $sP.Points.Clear()
-    $gap = [Math]::Max(8 * (Aranet-Interval), 120)  # only break across real outages (~2h+)
-    Add-GapAware $sC $data 'Co2'  $gap
-    Add-GapAware $sP $data 'Pres' $gap
-    Update-Granularity $chart
-    if ($chart.Titles.Count -gt 0 -and $TitleText) { $chart.Titles[0].Text = $TitleText }
-}
-
-# ---- NotifyIcon + menu ----------------------------------------------------
-$script:ni = New-Object System.Windows.Forms.NotifyIcon
-Update-Icon '...' (-not $script:settings.ConnectionEnabled)
-$script:ni.Text = 'LYWSD02 clock widget'
-$script:ni.Visible = $true
-
-$menu = New-Object System.Windows.Forms.ContextMenuStrip
-function New-Item([string]$text) { New-Object System.Windows.Forms.ToolStripMenuItem($text) }
-
-$miTitle      = New-Item 'LYWSD02 Clock + Aranet4'; $miTitle.Enabled = $false; $f=$miTitle.Font; $miTitle.Font = New-Object System.Drawing.Font($f.FontFamily,$f.Size,[System.Drawing.FontStyle]::Bold)
-$miReading    = New-Item 'No reading yet'; $miReading.Enabled = $false
-$miRead       = New-Item 'Read clock now'
-$miReadAranet = New-Item 'Read Aranet4 now'
-$miSync       = New-Item 'Sync clock now'
-$miTrends     = New-Item 'Open dashboard...'
-$miConn       = New-Item 'Connection enabled'
-$miLog        = New-Item 'Log hourly to CSV'
-$miClockIvl   = New-Item 'LYWSD02 read interval'
-$miAranet     = New-Item 'Track Aranet4 (CO2)'
-$miAranetIvl  = New-Item 'Aranet4 read interval'
-$miOpen       = New-Item 'Open data folder'
-$miStartup    = New-Item 'Run at login'
-$miExit       = New-Item 'Exit'
-
-# Sub-menu of selectable Aranet read intervals (minutes).
-$script:AranetIvlOptions = @(1,2,3,5,10,15,30)
-$script:miAranetIvlItems = @{}
-foreach ($mins in $script:AranetIvlOptions) {
-    $label = if ($mins -eq 1) { 'Every 1 minute' } else { "Every $mins minutes" }
-    $item = New-Object System.Windows.Forms.ToolStripMenuItem($label)
-    $item.Tag = $mins
-    $item.Add_Click({
-        param($s,$e)
-        $script:settings.AranetIntervalMinutes = [int]$s.Tag
-        $script:aranetDue = Get-Date            # apply immediately
-        Save-Settings; Refresh-Menu
-        Scheduler-Tick
-    })
-    [void]$miAranetIvl.DropDownItems.Add($item)
-    $script:miAranetIvlItems[$mins] = $item
-}
-
-# Sub-menu of selectable LYWSD02 read intervals (minutes). The clock connects
-# over BLE for each read, which uses its coin-cell battery, so the options are
-# more conservative than the (passive) Aranet's.
-$script:ClockIvlOptions = @(5,10,15,30,60)
-$script:miClockIvlItems = @{}
-foreach ($mins in $script:ClockIvlOptions) {
-    $item = New-Object System.Windows.Forms.ToolStripMenuItem("Every $mins minutes")
-    $item.Tag = $mins
-    $item.Add_Click({
-        param($s,$e)
-        $script:settings.IntervalMinutes = [int]$s.Tag
-        $script:clockDue = Get-Date              # apply immediately
-        Save-Settings; Refresh-Menu
-        Scheduler-Tick
-    })
-    [void]$miClockIvl.DropDownItems.Add($item)
-    $script:miClockIvlItems[$mins] = $item
-}
-
-$menu.Items.AddRange(@(
-    $miTitle, $miReading,
-    (New-Object System.Windows.Forms.ToolStripSeparator),
-    $miRead, $miReadAranet, $miSync, $miTrends,
-    (New-Object System.Windows.Forms.ToolStripSeparator),
-    $miConn, $miLog, $miClockIvl, $miAranet, $miAranetIvl, $miOpen, $miStartup,
-    (New-Object System.Windows.Forms.ToolStripSeparator),
-    $miExit
-))
-$script:ni.ContextMenuStrip = $menu
-
-# ---- Startup shortcut -----------------------------------------------------
-$StartupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'LYWSD02 Widget.lnk'
-function Test-Startup { Test-Path $StartupLnk }
-function Set-Startup {
-    param([bool]$On)
-    try {
-        if ($On) {
-            $wsh = New-Object -ComObject WScript.Shell
-            $sc = $wsh.CreateShortcut($StartupLnk)
-            $sc.TargetPath = Join-Path $ScriptDir 'Start-Widget.vbs'
-            $sc.WorkingDirectory = $ScriptDir
-            $sc.Description = 'LYWSD02 tray widget'
-            $sc.Save()
-        } elseif (Test-Path $StartupLnk) {
-            Remove-Item $StartupLnk -Force
-        }
-    } catch { WLog "WARN startup toggle failed: $($_.Exception.Message)" }
-}
-
-# ---- Menu state refresh ---------------------------------------------------
-function Job-Active([string]$device) {
-    foreach ($j in $script:jobs) { if ($j.Device -eq $device) { return $true } }
-    return $false
-}
-function Refresh-Menu {
-    $miConn.Checked    = [bool]$script:settings.ConnectionEnabled
-    $miConn.Text       = if ($script:settings.ConnectionEnabled) { 'Connection enabled (saving: off)' } else { 'Connection disabled (battery saver)' }
-    $miLog.Checked     = [bool]$script:settings.HourlyLogging
-    $miAranet.Checked  = [bool]$script:settings.AranetEnabled
-    $miStartup.Checked = (Test-Startup)
-    $clockBusy = Job-Active 'clock'
-    $miRead.Enabled = (-not $clockBusy) -and $script:settings.ConnectionEnabled
-    $miSync.Enabled = (-not $clockBusy) -and $script:settings.ConnectionEnabled
-    $miReadAranet.Enabled = $script:settings.ConnectionEnabled -and $script:settings.AranetEnabled
-    $ivl = [int]$script:settings.AranetIntervalMinutes; if ($ivl -lt 1) { $ivl = 5 }
-    $miAranetIvl.Enabled = [bool]$script:settings.AranetEnabled
-    $miAranetIvl.Text = "Aranet4 read interval ($ivl min)"
-    foreach ($k in $script:miAranetIvlItems.Keys) { $script:miAranetIvlItems[$k].Checked = ($k -eq $ivl) }
-    $civl = [int]$script:settings.IntervalMinutes; if ($civl -lt 1) { $civl = 60 }
-    $miClockIvl.Text = "LYWSD02 read interval ($civl min)"
-    foreach ($k in $script:miClockIvlItems.Keys) { $script:miClockIvlItems[$k].Checked = ($k -eq $civl) }
-}
-
-# ---- Tooltip --------------------------------------------------------------
-function Set-Tooltip {
-    $t = Reading-Text
-    if ($t.Length -gt 127) { $t = $t.Substring(0,124) + '...' }
-    try { $script:ni.Text = $t } catch {}
-}
-
-# ---- Async BLE jobs (one per device; delegated to the device scripts) -----
-$script:jobs = New-Object System.Collections.ArrayList
-
-function Start-Bg {
-    param([ValidateSet('read','sync')] [string]$Kind, [bool]$LogCsv, [bool]$Notify)
-    if (-not $script:settings.ConnectionEnabled) { if ($Notify) { Rs-Toast 'LYWSD02' 'Connection is off (battery saver). Turn it on to read the clock.' 'warn' }; return }
-    if (Job-Active 'clock') { if ($Notify) { Rs-Toast 'LYWSD02' 'A clock read is already in progress...' 'info' }; return }
-    $addr = $script:settings.Address
-    $scan = [int]$script:settings.ScanSeconds
-    $tmp  = [System.IO.Path]::GetTempFileName()
-    $common = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$SyncScript`" -Json -NoToggle -DeviceName `"$($script:settings.DeviceName)`" -ScanSeconds $scan"
-    if ($addr) { $common += " -Address `"$addr`"" }
-    if ($Kind -eq 'read') { $common += " -ReadSensors" }
-    Stop-AranetWatcher   # free the radio for the clock scan; resumed when it completes
-    try {
-        $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $common -WindowStyle Hidden -PassThru -RedirectStandardOutput $tmp
-        [void]$script:jobs.Add(@{ Proc=$p; Out=$tmp; Device='clock'; Kind=$Kind; LogCsv=$LogCsv; Notify=$Notify })
-        if ($Kind -eq 'read') { Update-Icon '..' (-not $script:settings.ConnectionEnabled) }
-        $script:poll.Start(); Refresh-Menu
-    } catch {
-        WLog "ERROR launching clock $Kind : $($_.Exception.Message)"
-        Remove-Item $tmp -ErrorAction SilentlyContinue
+    if ($script:trendChart) {
+        $C = [Vulcan.Data]::Clock
+        Fill-Series $script:trendChart 'Humidity' $C 1 $b $focus
+        Fill-Series $script:trendChart 'Temperature' $C 0 $b $focus
+        Fill-Series $script:trendChart 'Dew point' $C 3 $b $focus
+        $script:trendChart.Titles[0].Text = 'LYWSD02 clock'
+        Update-Granularity $script:trendChart
+    }
+    if ($script:trendCo2Chart) {
+        $A = [Vulcan.Data]::Air
+        Fill-Series $script:trendCo2Chart 'CO2' $A 0 $b $focus
+        Fill-Series $script:trendCo2Chart 'Pressure' $A 3 $b $focus
+        $script:trendCo2Chart.Titles[0].Text = 'Aranet4 air quality'
+        Update-Granularity $script:trendCo2Chart
     }
 }
-
-# ---- Aranet: persistent watcher daemon + instant file sampling ------------
-# The Aranet broadcasts only in bursts (with multi-minute gaps), so instead of
-# repeated short scans we keep ONE long-lived watcher (Watch-Aranet4.ps1) that
-# writes the latest reading to aranet-latest.json. The widget samples that file
-# on its own schedule - instant, no radio. The watcher is paused during the
-# (rare) clock scan so the two don't compete for the radio.
-function Stop-AranetWatcher {
-    try {
-        Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -like '*-File*Watch-Aranet4.ps1*' } |
-            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    } catch {}
-    $script:aranetWatcherPid = $null
+function Set-XGranularity($ax, [double]$spanH) {
+    $IT = [System.Windows.Forms.DataVisualization.Charting.DateTimeIntervalType]
+    if     ($spanH -gt 17520) { $ax.IntervalType = $IT::Years;   $ax.Interval = 1; $ax.LabelStyle.Format = 'yyyy' }
+    elseif ($spanH -gt 2880)  { $ax.IntervalType = $IT::Months;  $ax.Interval = 1; $ax.LabelStyle.Format = 'MMM yyyy' }
+    elseif ($spanH -gt 720)   { $ax.IntervalType = $IT::Weeks;   $ax.Interval = 1; $ax.LabelStyle.Format = 'MMM d' }
+    elseif ($spanH -gt 96)    { $ax.IntervalType = $IT::Days;    $ax.Interval = 1; $ax.LabelStyle.Format = 'ddd d' }
+    elseif ($spanH -gt 12)    { $ax.IntervalType = $IT::Hours;   $ax.Interval = 3; $ax.LabelStyle.Format = 'ddd HH:mm' }
+    elseif ($spanH -gt 2)     { $ax.IntervalType = $IT::Hours;   $ax.Interval = 1; $ax.LabelStyle.Format = 'HH:mm' }
+    elseif ($spanH -gt 0.5)   { $ax.IntervalType = $IT::Minutes; $ax.Interval = 10; $ax.LabelStyle.Format = 'HH:mm' }
+    else                      { $ax.IntervalType = $IT::Minutes; $ax.Interval = 2; $ax.LabelStyle.Format = 'HH:mm' }
 }
-function Ensure-AranetWatcher {
-    if (-not $script:settings.ConnectionEnabled) { return }
-    if (-not $script:settings.AranetEnabled) { return }
-    if (Job-Active 'clock') { return }   # never scan while the clock read is using the radio
-    # Reconcile to EXACTLY one watcher: duplicate advertisement watchers fight for
-    # the radio and drop broadcasts, so keep the newest and kill any extras.
-    $procs = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-               Where-Object { $_.CommandLine -like '*-File*Watch-Aranet4.ps1*' })
-    if ($procs.Count -ge 1) {
-        $keep = $procs | Sort-Object CreationDate -Descending | Select-Object -First 1
-        if ($procs.Count -gt 1) {
-            $procs | Where-Object { $_.ProcessId -ne $keep.ProcessId } | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
-            WLog "INFO killed $($procs.Count - 1) duplicate aranet watcher(s)"
-        }
-        $script:aranetWatcherPid = $keep.ProcessId
-        return
-    }
-    try {
-        $p = Start-Process -FilePath 'powershell.exe' -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$WatchScript`"" -WindowStyle Hidden -PassThru
-        $script:aranetWatcherPid = $p.Id
-        WLog "INFO aranet watcher started (pid $($p.Id))"
-    } catch { WLog "ERROR launching aranet watcher: $($_.Exception.Message)" }
-}
-function Sample-Aranet {
-    param([bool]$LogCsv, [bool]$Notify)
-    $data = $null
-    if (Test-Path $LatestJson) {
-        try { $data = Get-Content $LatestJson -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json } catch {}
-    }
-    if (-not ($data -and $data.ok)) {
-        if ($Notify) { Rs-Toast 'Aranet4' 'No reading captured yet (waiting for a broadcast).' 'warn' }
-        return
-    }
-    $ts = [string]$data.ts
-    $isNew = ($ts -ne $script:lastAranetTs)
-    # Stamp the reading with the broadcast capture time (data.ts), NOT the moment
-    # we read the file - otherwise a stale latest.json always looks "fresh".
-    $when = Get-Date
-    try { if ($ts) { $when = [datetime]::Parse($ts) } } catch {}
-    $script:lastAranet = @{
-        Co2=[int]$data.co2; TempC=[double]$data.tempC; Hum=[int]$data.humidity;
-        Pres=[double]$data.pressure; Battery=$data.battery; Status=[string]$data.status; When=$when
-    }
-    if ($isNew) {
-        $script:lastAranetTs = $ts
-        if ($LogCsv) { Append-AranetCsv -Co2 $script:lastAranet.Co2 -TempC $script:lastAranet.TempC -Humidity $script:lastAranet.Hum -Pressure $script:lastAranet.Pres -Battery $script:lastAranet.Battery -Status $script:lastAranet.Status }
-        WLog "INFO aranet co2=$($script:lastAranet.Co2) status=$($script:lastAranet.Status) (captured $ts)"
-    }
-    if ($Notify) {
-        $ageS = [int]((Get-Date)-$when).TotalSeconds
-        $ageTxt = if ($ageS -lt 90) { "captured ${ageS}s ago" } else { "captured at $($when.ToString('HH:mm'))" }
-        Rs-Toast 'Aranet4' ("{0} ppm CO2 ({1})   {2:0.0} hPa   -   {3}" -f $script:lastAranet.Co2,$script:lastAranet.Status,$script:lastAranet.Pres,$ageTxt) 'info'
-    }
-    Set-Tooltip
-    $miReading.Text = Reading-Text
-    if ($script:popupShown) { try { Update-PopupData; $script:popupPanel.Invalidate() } catch {} }
-    Refresh-Dashboard
-}
-# "Read Aranet4 now": the Aranet broadcasts on its own schedule and we can't
-# command it, so instead of just re-showing the cached file, wait (briefly, off
-# the UI thread) for the watcher to capture a NEW broadcast, then sample. If none
-# arrives in the window, say so honestly rather than silently recalling the old one.
-function Read-AranetTs {
-    if (-not (Test-Path $LatestJson)) { return '' }
-    try { return [string]((Get-Content $LatestJson -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json).ts) } catch { return '' }
-}
-function Force-Aranet {
-    if (-not $script:settings.AranetEnabled) { Rs-Toast 'Aranet4' 'Aranet tracking is off. Turn it on to read.' 'warn'; return }
-    Ensure-AranetWatcher
-    $prev = Read-AranetTs
-    $ageSec = 99999.0
-    if ($prev) { try { $ageSec = ((Get-Date)-[datetime]$prev).TotalSeconds } catch {} }
-    # The Aranet only measures/broadcasts ~once a minute, so a recent capture IS
-    # the freshest the device offers - show it at once. Only wait for the next
-    # packet if what we have is genuinely stale.
-    if ($prev -and $ageSec -lt 75) { Sample-Aranet -LogCsv $true -Notify $true; return }
-    $script:aranetForce = @{ Prev = $prev; Deadline = (Get-Date).AddSeconds(80) }
-    Rs-Toast 'Aranet4' 'Waiting for the next broadcast (the Aranet updates about once a minute)...' 'info'
-    $script:aranetForceTimer.Start()
-}
-function Aranet-ForceTick {
-    if (-not $script:aranetForce) { $script:aranetForceTimer.Stop(); return }
-    $cur = Read-AranetTs
-    if ($cur -and $cur -ne $script:aranetForce.Prev) {
-        $script:aranetForce = $null; $script:aranetForceTimer.Stop()
-        Sample-Aranet -LogCsv $true -Notify $true
-    } elseif ((Get-Date) -ge $script:aranetForce.Deadline) {
-        $script:aranetForce = $null; $script:aranetForceTimer.Stop()
-        Sample-Aranet -LogCsv $true -Notify $false
-        Rs-Toast 'Aranet4' 'No broadcast received - the Aranet may be out of range, the clock read may be using the radio, or Smart Home broadcasting is off in the Aranet app.' 'warn'
-        Refresh-Dashboard
-    }
-}
-
-function Read-JobJson($j) {
-    $raw = ''
-    try { $raw = Get-Content $j.Out -Raw -ErrorAction SilentlyContinue } catch {}
-    Remove-Item $j.Out -ErrorAction SilentlyContinue
-    $line = ($raw -split "`r?`n" | Where-Object { $_ -match '^\s*\{' } | Select-Object -First 1)
-    if ($line) { try { return ($line | ConvertFrom-Json) } catch {} }
-    return $null
-}
-
-function Complete-Clock($j, $data) {
-    if ($data -and $data.ok) {
-        $tc = [double]$data.tempC; $hu = [int]$data.humidity; $bat = $data.battery
-        $script:lastReading = @{ TempC=$tc; Humidity=$hu; Battery=$bat; When=(Get-Date) }
-        Update-Icon ([string][math]::Round($tc)) (-not $script:settings.ConnectionEnabled)
-        if ($data.addr -and $data.addr -ne $script:settings.Address) {
-            WLog "INFO learned/updated address: $($data.addr)"
-            $script:settings.Address = $data.addr; Save-Settings
-        }
-        if ($j.LogCsv) { Append-Csv -TempC $tc -Humidity $hu -Battery $bat }
-        if ($j.Notify) {
-            $batTxt = if ($null -eq $bat) { '?' } else { "$bat%" }
-            Rs-Toast 'LYWSD02' ("{0:0.0} C   {1}% RH   battery {2}" -f $tc,$hu,$batTxt) 'info'
-        }
-    } else {
-        if ($j.Kind -eq 'read') { Update-Icon '--' (-not $script:settings.ConnectionEnabled) }
-        if ($j.Notify) {
-            $msg = if ($j.Kind -eq 'sync') { 'Clock sync failed (not seen / out of range).' } else { 'Could not read the clock (not seen / out of range).' }
-            Rs-Toast 'LYWSD02' $msg 'warn'
-        }
-        WLog "WARN clock $($j.Kind) failed"
-        return
-    }
-    if ($j.Kind -eq 'sync' -and $j.Notify) { Rs-Toast 'LYWSD02' 'Clock time synchronised.' 'info' }
-    if ($j.Kind -eq 'sync') { WLog 'INFO clock synced' }
-}
-
-function Poll-Jobs {
-    if ($script:jobs.Count -eq 0) { $script:poll.Stop(); return }
-    $done = @($script:jobs | Where-Object { $_.Proc.HasExited })
-    $clockCompleted = $false
-    foreach ($j in $done) {
-        $script:jobs.Remove($j)
-        $data = Read-JobJson $j
-        Complete-Clock $j $data
-        $clockCompleted = $true
-    }
-    # Clock scan finished -> the radio is free again, so resume the Aranet watcher.
-    if ($clockCompleted) { Ensure-AranetWatcher }
-    if ($done.Count -gt 0) {
-        Set-Tooltip
-        $miReading.Text = Reading-Text
-        if ($script:popupShown) { try { Update-PopupData; $script:popupPanel.Invalidate() } catch {} }
-        Refresh-Dashboard
-        Refresh-Menu
-    }
-    if ($script:jobs.Count -eq 0) { $script:poll.Stop() }
-}
-
-# ---- Timers ---------------------------------------------------------------
-$script:poll = New-Object System.Windows.Forms.Timer
-$script:poll.Interval = 1500
-$script:poll.Add_Tick({ Poll-Jobs })
-
-# Polls the latest-reading file while "Read Aranet4 now" waits for a fresh packet.
-$script:aranetForce = $null
-$script:aranetForceTimer = New-Object System.Windows.Forms.Timer
-$script:aranetForceTimer.Interval = 700
-$script:aranetForceTimer.Add_Tick({ Aranet-ForceTick })
-
-# ---- Scheduler: one BLE scan at a time, independent per-device intervals ---
-# Each device has its own "due" time. A single ticking scheduler runs whichever
-# device is due, but only when the radio is free - so frequent Aranet reads can
-# never starve the hourly clock read (the clock just runs the moment the radio
-# frees after its hour is up).
-$script:clockDue  = Get-Date   # due immediately on launch
-$script:aranetDue = Get-Date
-function Aranet-Interval { $m = [int]$script:settings.AranetIntervalMinutes; if ($m -lt 1) { 5 } else { $m } }
-function Clock-Interval  { $m = [int]$script:settings.IntervalMinutes; if ($m -lt 1) { 60 } else { $m } }
-function Scheduler-Tick {
-    if (-not $script:settings.ConnectionEnabled) { return }
-    $now = Get-Date
-    $log = [bool]$script:settings.HourlyLogging
-    # Clock read uses the radio (and pauses the watcher). Do it first; if we start
-    # one, return so we don't immediately re-start the watcher we just paused.
-    if (-not (Job-Active 'clock') -and $now -ge $script:clockDue) {
-        $script:clockDue = $now.AddMinutes((Clock-Interval))
-        Start-Bg -Kind 'read' -LogCsv $log -Notify $false
-        return
-    }
-    Ensure-AranetWatcher   # keep the persistent listener alive (no-op if already running)
-    # Aranet "read" is just sampling the watcher's latest file - no radio, safe anytime.
-    if ($script:settings.AranetEnabled -and $now -ge $script:aranetDue) {
-        $script:aranetDue = $now.AddMinutes((Aranet-Interval))
-        Sample-Aranet -LogCsv $log -Notify $false
-    }
-}
-$script:sched = New-Object System.Windows.Forms.Timer
-$script:sched.Interval = 10000   # poll every 10s; real cadence is set by the due times
-$script:sched.Add_Tick({ Scheduler-Tick })
-$script:sched.Start()
-
-# Fast first read shortly after launch so the icon/values populate.
-$script:kick = New-Object System.Windows.Forms.Timer
-$script:kick.Interval = 2500
-$script:kick.Add_Tick({ $script:kick.Stop(); Scheduler-Tick })
-$script:kick.Start()
-
-# ---- Hover popup + trends window ------------------------------------------
-$script:popupShown   = $false
-$script:popupAnchor  = New-Object System.Drawing.Point(0,0)
-$script:suppressUntil = 0
-$script:trendForm    = $null
-$script:trendChart   = $null
-$script:trendCo2Chart = $null
-$script:lastAranet   = $null
-$script:lastAranetTs = ''
-$script:aranetWatcherPid = $null
-
-# Hover popup: a compact Room State summary that matches the dashboard.
-$script:popupData = $null
-$script:popup = New-Object NoActivatePopup
-$script:popup.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
-$script:popup.ControlBox      = $false
-$script:popup.ShowInTaskbar   = $false
-$script:popup.TopMost         = $true
-$script:popup.StartPosition   = [System.Windows.Forms.FormStartPosition]::Manual
-$script:popup.Size            = New-Object System.Drawing.Size(384,160)
-$script:popup.BackColor       = [System.Drawing.Color]::FromArgb(13,14,16)   # themed at show time
-$script:popupPanel = New-Object System.Windows.Forms.Panel
-$script:popupPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
-$script:popupPanel.BackColor = [System.Drawing.Color]::FromArgb(13,14,16)
-try { ([System.Windows.Forms.Control].GetProperty('DoubleBuffered',[System.Reflection.BindingFlags]'Instance,NonPublic')).SetValue($script:popupPanel,$true,$null) } catch {}
-$script:popupPanel.Add_Paint({ param($s,$e); try { Rs-PaintPopup $e.Graphics $this } catch { WLog "rs popup: $($_.Exception.Message)" } })
-$script:popup.Controls.Add($script:popupPanel)
-# Force handle + layout once, offscreen, so the first hover paints correctly.
-$script:popup.Location = New-Object System.Drawing.Point(-4000,-4000)
-$script:popup.Show(); $script:popup.Hide()
-# Clicking the hover popup opens the full Room State dashboard.
-$popupClick = { Hide-Popup; Show-Dashboard }
-$script:popup.Add_Click($popupClick)
-$script:popupPanel.Add_Click($popupClick)
-
-function Show-Popup {
-    param([int]$cx,[int]$cy)
-    try {
-        Update-PopupData
-        $script:popup.BackColor = $script:DashTheme.Canvas; $script:popupPanel.BackColor = $script:DashTheme.Canvas
-        $script:popupPanel.Invalidate()
-        $scr = [System.Windows.Forms.Screen]::FromPoint((New-Object System.Drawing.Point($cx,$cy))).WorkingArea
-        $w = $script:popup.Width; $h = $script:popup.Height
-        $x = [math]::Min([math]::Max([int]($cx - $w/2), $scr.Left), $scr.Right - $w)
-        $y = $cy - $h - 12; if ($y -lt $scr.Top) { $y = $cy + 24 }
-        $script:popup.Location = New-Object System.Drawing.Point([int]$x, [int]$y)
-        $script:popup.Show()
-        $script:popup.TopMost = $true
-        $script:popupShown  = $true
-        $script:popupAnchor = New-Object System.Drawing.Point($cx, $cy)
-        $script:hide.Start()
-    } catch { WLog "WARN show-popup: $($_.Exception.Message)" }
-}
-function Hide-Popup {
-    if ($script:popupShown) {
-        try { $script:popup.Hide() } catch {}
-        $script:popupShown = $false
-        $script:hide.Stop()
-    }
-}
-
-$script:hide = New-Object System.Windows.Forms.Timer
-$script:hide.Interval = 150
-$script:hide.Add_Tick({
-    try {
-        if (-not $script:popupShown) { $script:hide.Stop(); return }
-        $p = [System.Windows.Forms.Cursor]::Position
-        $b = $script:popup.Bounds; $b.Inflate(8,8)
-        $overPopup = $b.Contains($p)
-        # Any mouse click outside the popup (tray icon, desktop, another window) dismisses it.
-        if (-not $overPopup -and [System.Windows.Forms.Control]::MouseButtons -ne [System.Windows.Forms.MouseButtons]::None) { Hide-Popup; return }
-        # Hover away: cursor has left both the popup and the tray-icon area.
-        $a = $script:popupAnchor
-        $nearAnchor = ([math]::Abs($p.X-$a.X) -le 40 -and [math]::Abs($p.Y-$a.Y) -le 40)
-        if (-not $overPopup -and -not $nearAnchor) { Hide-Popup }
-    } catch {}
-})
-
-# ---- Scroll-wheel zoom on the trends window -------------------------------
-# Returns the X data range (OADate doubles) and largest point count of a chart.
 function Get-ChartXRange($chart) {
     $mn = [double]::PositiveInfinity; $mx = [double]::NegativeInfinity; $pc = 0
     foreach ($s in $chart.Series) {
         $n = $s.Points.Count
         if ($n -gt 0) {
-            if ($s.Points[0].XValue   -lt $mn) { $mn = $s.Points[0].XValue }
+            if ($s.Points[0].XValue -lt $mn) { $mn = $s.Points[0].XValue }
             if ($s.Points[$n-1].XValue -gt $mx) { $mx = $s.Points[$n-1].XValue }
             if ($n -gt $pc) { $pc = $n }
         }
     }
     return @{ Min=$mn; Max=$mx; Count=$pc }
 }
-function Zoom-Reset {
-    foreach ($c in @($script:trendChart, $script:trendCo2Chart)) {
-        if ($c) { try { $c.ChartAreas['main'].AxisX.ScaleView.ZoomReset(0); Update-Granularity $c } catch {} }
-    }
+function Update-Granularity($chart) {
+    if (-not $chart -or $chart.ChartAreas.Count -eq 0) { return }
+    try {
+        $ax = $chart.ChartAreas['main'].AxisX; $sv = $ax.ScaleView
+        $r = Get-ChartXRange $chart
+        if ($r.Count -lt 2) { return }
+        if ($sv.IsZoomed) { $spanH = ($sv.ViewMaximum - $sv.ViewMinimum) * 24 } else { $spanH = ($r.Max - $r.Min) * 24 }
+        if ($spanH -le 0) { $spanH = 1 }
+        Set-XGranularity $ax $spanH
+    } catch {}
 }
-# Apply the same absolute time window [vmin,vmax] (OADate) to both charts, each
-# clamped to its own data range, so the two devices stay time-aligned.
+function Zoom-Reset {
+    $script:zoomBusy = $true
+    try {
+        Rebuild-Both
+        foreach ($c in @($script:trendChart, $script:trendCo2Chart)) { if ($c) { try { $c.ChartAreas['main'].AxisX.ScaleView.ZoomReset(0); Update-Granularity $c } catch {} } }
+    } finally { $script:zoomBusy = $false }
+}
+# Show the same time window [vmin,vmax] (OADate) on both charts, re-sampled at full detail.
 function Zoom-Apply($vmin, $vmax) {
-    foreach ($c in @($script:trendChart, $script:trendCo2Chart)) {
-        if (-not $c) { continue }
-        try {
-            $r = Get-ChartXRange $c
-            if ($r.Count -lt 2 -or $r.Max -le $r.Min) { continue }
-            $mn = [math]::Max($vmin, $r.Min); $mx = [math]::Min($vmax, $r.Max)
-            if ($mx -gt $mn) { $c.ChartAreas['main'].AxisX.ScaleView.Zoom($mn, $mx) }
-            else { $c.ChartAreas['main'].AxisX.ScaleView.ZoomReset(0) }
-            Update-Granularity $c   # step ticks through years/months/.../minutes
-        } catch {}
-    }
+    if ($script:zoomBusy) { return }
+    $script:zoomBusy = $true
+    try {
+        $span = $vmax - $vmin
+        Rebuild-Both @{ From = [datetime]::FromOADate($vmin - $span); To = [datetime]::FromOADate($vmax + $span) }
+        foreach ($c in @($script:trendChart, $script:trendCo2Chart)) {
+            if (-not $c) { continue }
+            try {
+                $r = Get-ChartXRange $c
+                if ($r.Count -lt 2 -or $r.Max -le $r.Min) { continue }
+                $mn = [math]::Max($vmin, $r.Min); $mx = [math]::Min($vmax, $r.Max)
+                if ($mx -gt $mn) { $c.ChartAreas['main'].AxisX.ScaleView.Zoom($mn, $mx) } else { $c.ChartAreas['main'].AxisX.ScaleView.ZoomReset(0) }
+                Update-Granularity $c
+            } catch {}
+        }
+    } finally { $script:zoomBusy = $false }
 }
 $script:OnChartWheel = {
     param($sender, $e)
@@ -870,94 +1047,83 @@ $script:OnChartWheel = {
         if ($sv.IsZoomed) { $curMin = $sv.ViewMinimum; $curMax = $sv.ViewMaximum } else { $curMin = $r.Min; $curMax = $r.Max }
         if ([double]::IsNaN($curMin) -or [double]::IsNaN($curMax) -or $curMax -le $curMin) { $curMin = $r.Min; $curMax = $r.Max }
         $curRange = $curMax - $curMin
-        # Anchor the zoom on the time value under the cursor.
         $anchor = $null
         try { $anchor = $ax.PixelPositionToValue([double]$e.Location.X) } catch {}
         if ($null -eq $anchor -or [double]::IsNaN($anchor) -or $anchor -lt $curMin -or $anchor -gt $curMax) { $anchor = ($curMin + $curMax) / 2 }
-        $minRange = 3.0 * $fullRange / $r.Count            # ~3 samples = max zoom-in
-        $factor = if ($e.Delta -gt 0) { 0.8 } else { 1.25 } # wheel up = zoom in
+        $minRange = 10.0 / 1440.0                             # ten minutes is as far in as it goes
+        $factor = if ($e.Delta -gt 0) { 0.75 } else { 1.333 } # wheel up = zoom in
         $newRange = $curRange * $factor
-        if ($newRange -ge $fullRange) { Zoom-Reset; return } # zoomed all the way out
+        if ($newRange -ge $fullRange) { Zoom-Reset; return }
         if ($newRange -lt $minRange) { $newRange = $minRange }
         $leftFrac = ($anchor - $curMin) / $curRange
-        $newMin = $anchor - $leftFrac * $newRange
-        $newMax = $newMin + $newRange
+        $newMin = $anchor - $leftFrac * $newRange; $newMax = $newMin + $newRange
         if ($newMin -lt $r.Min) { $newMin = $r.Min; $newMax = $r.Min + $newRange }
         if ($newMax -gt $r.Max) { $newMax = $r.Max; $newMin = $r.Max - $newRange }
         Zoom-Apply $newMin $newMax
     } catch {}
 }
-
 function Show-TrendsWindow {
     try {
         if ($script:trendForm -and -not $script:trendForm.IsDisposed) {
-            Rebuild-ChartData $script:trendChart ("LYWSD02 (clock)   -   " + (Reading-Text))
-            if ($script:trendCo2Chart) { Rebuild-Co2Data $script:trendCo2Chart 'Aranet4 (air quality)' }
+            Rebuild-Both
             $script:trendForm.WindowState = [System.Windows.Forms.FormWindowState]::Normal
             $script:trendForm.Activate(); return
         }
+        Add-Type -AssemblyName System.Windows.Forms.DataVisualization
+        $T = $script:DashTheme
         $f = New-Object System.Windows.Forms.Form
-        $f.Text = 'Environment trends  -  LYWSD02 + Aranet4   (scroll to zoom, scrollbar to pan)'
-        $f.Size = New-Object System.Drawing.Size(920,640)
-        $f.MinimumSize = New-Object System.Drawing.Size(580,420)
+        $f.Text = 'Trends  -  scroll to zoom, drag the scrollbar to pan'
+        $f.Size = New-Object System.Drawing.Size(980,680); $f.MinimumSize = New-Object System.Drawing.Size(600,440)
         $f.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-        $f.BackColor = [System.Drawing.Color]::FromArgb(24,24,28)
-        $fg = [System.Drawing.Color]::FromArgb(225,225,225)
-        # Two devices, two stacked charts: LYWSD02 (top) and Aranet4 (bottom).
-        $envChart = New-TrendChart $false; $envChart.Dock = [System.Windows.Forms.DockStyle]::Fill
-        $co2Chart = New-Co2Chart  $false; $co2Chart.Dock = [System.Windows.Forms.DockStyle]::Fill
-        # Mouse-wheel zoom (time axis). Focus the chart on hover so it gets the wheel.
+        $f.BackColor = $T.Canvas; $f.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+        try { $f.Icon = [System.Drawing.Icon]::FromHandle($script:iconHandle) } catch {}
+        $envChart = New-TrendChart; $envChart.Dock = [System.Windows.Forms.DockStyle]::Fill
+        $co2Chart = New-Co2Chart;   $co2Chart.Dock = [System.Windows.Forms.DockStyle]::Fill
         foreach ($c in @($envChart, $co2Chart)) {
             $c.Add_MouseEnter({ try { $this.Focus() } catch {} })
             $c.Add_MouseWheel($script:OnChartWheel)
+            # panning with the scrollbar: keep the detail under the view
+            $c.Add_AxisViewChanged({ param($s,$e); try { if (-not $script:zoomBusy -and -not [double]::IsNaN($e.NewPosition) -and $e.NewSize -gt 0) { Zoom-Apply $e.NewPosition ($e.NewPosition + $e.NewSize) } } catch {} })
         }
         $split = New-Object System.Windows.Forms.SplitContainer
         $split.Dock = [System.Windows.Forms.DockStyle]::Fill
         $split.Orientation = [System.Windows.Forms.Orientation]::Horizontal
-        $split.BackColor = [System.Drawing.Color]::FromArgb(24,24,28)
-        $split.Panel1MinSize = 90; $split.Panel2MinSize = 90
-        $split.Panel1.Controls.Add($envChart)
-        $split.Panel2.Controls.Add($co2Chart)
+        $split.BackColor = $T.Canvas; $split.Panel1MinSize = 90; $split.Panel2MinSize = 90; $split.SplitterWidth = 8
+        $split.Panel1.Controls.Add($envChart); $split.Panel2.Controls.Add($co2Chart)
         $bar = New-Object System.Windows.Forms.Panel
-        $bar.Dock = [System.Windows.Forms.DockStyle]::Bottom; $bar.Height = 40
-        $bar.BackColor = [System.Drawing.Color]::FromArgb(24,24,28)
+        $bar.Size = New-Object System.Drawing.Size($f.ClientSize.Width, 52)
+        $bar.Dock = [System.Windows.Forms.DockStyle]::Bottom; $bar.BackColor = $T.Canvas
 
         $lblRange = New-Object System.Windows.Forms.Label
-        $lblRange.Text = 'Range:'; $lblRange.ForeColor = $fg; $lblRange.AutoSize = $true
-        $lblRange.Location = New-Object System.Drawing.Point(8,11)
-        # These controls are referenced from event handlers that fire AFTER this
-        # function returns, so they must live in script scope (PowerShell handler
-        # scriptblocks don't capture function locals).
+        $lblRange.Text = 'Range'; $lblRange.ForeColor = $T.TextS; $lblRange.AutoSize = $true; $lblRange.Location = New-Object System.Drawing.Point(14,18)
+        # These are used by event handlers that fire after this function returns, so
+        # they live in script scope (handler scriptblocks do not capture locals).
         $script:cbRange = New-Object System.Windows.Forms.ComboBox
         $script:cbRange.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
-        $script:cbRange.Width = 130; $script:cbRange.Location = New-Object System.Drawing.Point(54,7)
+        $script:cbRange.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+        $script:cbRange.BackColor = $T.Sunken; $script:cbRange.ForeColor = $T.TextP
+        $script:cbRange.Width = 140; $script:cbRange.Location = New-Object System.Drawing.Point(62,14)
         foreach ($k in $script:RangeMap.Keys) { [void]$script:cbRange.Items.Add($k) }
-        # Select the saved range (default 7 days).
         $curCode = $script:settings.TrendRange; if (-not $curCode) { $curCode = '7d' }
         $curLabel = ($script:RangeMap.GetEnumerator() | Where-Object { $_.Value -eq $curCode } | Select-Object -First 1).Key
         if (-not $curLabel) { $curLabel = 'Last 7 days' }
         $script:cbRange.SelectedItem = $curLabel
-
         $script:dtFrom = New-Object System.Windows.Forms.DateTimePicker
         $script:dtFrom.Format = [System.Windows.Forms.DateTimePickerFormat]::Short
-        $script:dtFrom.Width = 110; $script:dtFrom.Location = New-Object System.Drawing.Point(192,8)
+        $script:dtFrom.Width = 110; $script:dtFrom.Location = New-Object System.Drawing.Point(214,14)
         $script:dtTo = New-Object System.Windows.Forms.DateTimePicker
         $script:dtTo.Format = [System.Windows.Forms.DateTimePickerFormat]::Short
-        $script:dtTo.Width = 110; $script:dtTo.Location = New-Object System.Drawing.Point(312,8)
-        $lblTo = New-Object System.Windows.Forms.Label
-        $lblTo.Text='to'; $lblTo.ForeColor=$fg; $lblTo.AutoSize=$true; $lblTo.Location=New-Object System.Drawing.Point(304,11)
-        $script:lblTo = $lblTo
-        if ($script:settings.TrendFrom) { try { $script:dtFrom.Value = [datetime]$script:settings.TrendFrom } catch {} } else { $script:dtFrom.Value = (Get-Date).AddDays(-7) }
-        if ($script:settings.TrendTo)   { try { $script:dtTo.Value   = [datetime]$script:settings.TrendTo }   catch {} }
+        $script:dtTo.Width = 110; $script:dtTo.Location = New-Object System.Drawing.Point(350,14)
+        $script:lblTo = New-Object System.Windows.Forms.Label
+        $script:lblTo.Text = 'to'; $script:lblTo.ForeColor = $T.TextS; $script:lblTo.AutoSize = $true; $script:lblTo.Location = New-Object System.Drawing.Point(329,18)
+        try { if ($script:settings.TrendFrom) { $script:dtFrom.Value = [datetime]$script:settings.TrendFrom } else { $script:dtFrom.Value = (Get-Date).AddDays(-7) } } catch {}
+        try { if ($script:settings.TrendTo) { $script:dtTo.Value = ([datetime]$script:settings.TrendTo).Date } } catch {}
         $showCustom = ($curCode -eq 'custom')
-        $script:dtFrom.Visible = $showCustom; $script:dtTo.Visible = $showCustom; $lblTo.Visible = $showCustom
-
+        $script:dtFrom.Visible = $showCustom; $script:dtTo.Visible = $showCustom; $script:lblTo.Visible = $showCustom
         $applyRange = {
             try {
-                $sel = $script:cbRange.SelectedItem
-                if (-not $sel) { return }
-                $code = $script:RangeMap[[string]$sel]
-                if (-not $code) { return }
+                $sel = $script:cbRange.SelectedItem; if (-not $sel) { return }
+                $code = $script:RangeMap[[string]$sel]; if (-not $code) { return }
                 $script:settings.TrendRange = $code
                 $isCustom = ($code -eq 'custom')
                 $script:dtFrom.Visible = $isCustom; $script:dtTo.Visible = $isCustom; $script:lblTo.Visible = $isCustom
@@ -966,976 +1132,393 @@ function Show-TrendsWindow {
                     $script:settings.TrendTo   = $script:dtTo.Value.Date.AddDays(1).AddSeconds(-1).ToString('yyyy-MM-dd HH:mm:ss')
                 }
                 Save-Settings
-                Rebuild-Both
-                Zoom-Reset   # new time scope -> start unzoomed
+                Zoom-Reset
             } catch { WLog "WARN range change: $($_.Exception.Message)" }
         }
         $script:cbRange.Add_SelectedIndexChanged($applyRange)
         $script:dtFrom.Add_ValueChanged($applyRange)
         $script:dtTo.Add_ValueChanged($applyRange)
-
+        $bReset = New-Object Vulcan.PillButton; $bReset.Text = 'Reset zoom'; $bReset.BackColor = $T.Canvas; [void]$bReset.Fit()
+        $bFolder = New-Object Vulcan.PillButton; $bFolder.Text = 'Open data folder'; $bFolder.Glyph = $script:GlFolder; $bFolder.BackColor = $T.Canvas; [void]$bFolder.Fit()
+        $bFolder.Anchor = ([System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right)
+        $bReset.Anchor = $bFolder.Anchor
         $cw = $f.ClientSize.Width
-        $btnRefresh = New-Object System.Windows.Forms.Button
-        $btnRefresh.Text='Refresh'; $btnRefresh.Width=80; $btnRefresh.ForeColor=$fg; $btnRefresh.FlatStyle=[System.Windows.Forms.FlatStyle]::Flat
-        $btnRefresh.Anchor=([System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right)
-        $btnRefresh.Location=New-Object System.Drawing.Point(($cw-186),6)
-        $btnData = New-Object System.Windows.Forms.Button
-        $btnData.Text='Open data'; $btnData.Width=92; $btnData.ForeColor=$fg; $btnData.FlatStyle=[System.Windows.Forms.FlatStyle]::Flat
-        $btnData.Anchor=([System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right)
-        $btnData.Location=New-Object System.Drawing.Point(($cw-98),6)
-        $btnRefresh.Add_Click({ Rebuild-Both })
-        $btnData.Add_Click({ Start-Process explorer.exe $LogDir })
-
-        $bar.Controls.AddRange(@($lblRange,$script:cbRange,$script:dtFrom,$lblTo,$script:dtTo,$btnRefresh,$btnData))
-        $f.Controls.Add($split)   # Fill added first
-        $f.Controls.Add($bar)     # Bottom added last
+        $bFolder.Location = New-Object System.Drawing.Point(($cw - $bFolder.Width - 14), 8)
+        $bReset.Location = New-Object System.Drawing.Point(($bFolder.Left - $bReset.Width - 8), 8)
+        $bReset.Add_Click({ Zoom-Reset })
+        $bFolder.Add_Click({ Start-Process explorer.exe $LogDir })
+        $bar.Controls.AddRange(@($lblRange, $script:cbRange, $script:dtFrom, $script:lblTo, $script:dtTo, $bReset, $bFolder))
+        $f.Controls.Add($split)   # Fill first
+        $f.Controls.Add($bar)     # Bottom last
         $script:trendForm = $f; $script:trendChart = $envChart; $script:trendCo2Chart = $co2Chart
+        $script:trendSplit = $split
         Rebuild-Both
-        $f.Add_Shown({ try { $split.SplitterDistance = [int]($split.Height * 0.55) } catch {} })
+        $f.Add_Shown({ try { $script:trendSplit.SplitterDistance = [int]($script:trendSplit.Height * 0.52) } catch {} })
         $f.Add_FormClosed({ $script:trendForm = $null; $script:trendChart = $null; $script:trendCo2Chart = $null })
         $f.Show(); $f.Activate()
-    } catch { WLog "ERROR trends window: $($_.Exception.Message)" }
-}
-function Rebuild-Both {
-    if ($script:trendChart) { Rebuild-ChartData $script:trendChart ("LYWSD02 (clock)   -   " + (Reading-Text)) }
-    if ($script:trendCo2Chart) { Rebuild-Co2Data $script:trendCo2Chart 'Aranet4 (air quality)' }
+    } catch { WLog "ERROR trends window: $($_.Exception.Message) :: $($_.ScriptStackTrace)" }
 }
 
 # ===========================================================================
-#  Dashboard - the main, shippable UI
+#  Room state dashboard
+#  A verdict-led view: one plain-language read of the room, then quiet cards
+#  that each answer a human question. One accent; colour only where it means
+#  something. Painters read $script:rs and never compute.
 # ===========================================================================
-# Default Room State theme (dark). Build-Theme is defined later in the module;
-# this inline copy is the fallback used by the hover popup before the dashboard
-# is first opened. Apply-Theme overrides it from the saved setting at startup.
-$script:DashTheme = @{
-    Mode='dark'
-    Canvas=[System.Drawing.Color]::FromArgb(13,14,16); Surface=[System.Drawing.Color]::FromArgb(23,24,27); Sunken=[System.Drawing.Color]::FromArgb(30,31,35)
-    TextP=[System.Drawing.Color]::FromArgb(244,244,241); TextS=[System.Drawing.Color]::FromArgb(162,164,172); TextT=[System.Drawing.Color]::FromArgb(110,112,119)
-    Hairline=[System.Drawing.Color]::FromArgb(20,255,255,255); Accent=[System.Drawing.Color]::FromArgb(43,182,164); AccentWash=[System.Drawing.Color]::FromArgb(26,43,182,164)
-    Caution=[System.Drawing.Color]::FromArgb(214,162,74); Alert=[System.Drawing.Color]::FromArgb(215,122,92)
-}
-$script:DashTheme.Bg=$script:DashTheme.Canvas; $script:DashTheme.Card=$script:DashTheme.Surface; $script:DashTheme.Card2=$script:DashTheme.Sunken; $script:DashTheme.Border=$script:DashTheme.Hairline
-$script:DashTheme.Text=$script:DashTheme.TextP; $script:DashTheme.Muted=$script:DashTheme.TextS; $script:DashTheme.Good=$script:DashTheme.Accent; $script:DashTheme.Warn=$script:DashTheme.Caution; $script:DashTheme.Bad=$script:DashTheme.Alert
-$script:DashTheme.Temp=$script:DashTheme.Accent; $script:DashTheme.Hum=$script:DashTheme.Accent; $script:DashTheme.Co2=$script:DashTheme.Accent; $script:DashTheme.Pres=$script:DashTheme.Accent; $script:DashTheme.Batt=$script:DashTheme.Accent
-function DashFont([single]$size, [string]$style='Regular', [string]$family='Segoe UI') {
-    New-Object System.Drawing.Font($family, $size, [System.Drawing.FontStyle]$style)
-}
-function Fill-Round($g, $brush, $rect, $r) {
-    $x = [int]$rect.X; $y = [int]$rect.Y; $w = [int]$rect.Width; $h = [int]$rect.Height
-    $d = [int]$r * 2
-    if ($d -gt $w) { $d = $w }; if ($d -gt $h) { $d = $h }
-    $gp = New-Object System.Drawing.Drawing2D.GraphicsPath
-    $gp.AddArc($x, $y, $d, $d, 180, 90)
-    $gp.AddArc(($x + $w - $d), $y, $d, $d, 270, 90)
-    $gp.AddArc(($x + $w - $d), ($y + $h - $d), $d, $d, 0, 90)
-    $gp.AddArc($x, ($y + $h - $d), $d, $d, 90, 90)
-    $gp.CloseFigure()
-    $g.FillPath($brush, $gp)
-    $gp.Dispose()
-}
-# Custom double-buffered controls. Plain WinForms panels don't double-buffer and
-# don't redraw on resize, so our owner-drawn cards smear/ghost when the window is
-# resized (each layout pass paints over the last). These types fix that.
-function Ensure-DashTypes {
-    if ('Vulcan.CardPanel' -as [type]) { return }
-    Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @"
-using System.Windows.Forms;
-namespace Vulcan {
-  public class CardPanel : Panel {
-    public CardPanel() {
-      this.DoubleBuffered = true;
-      this.SetStyle(ControlStyles.ResizeRedraw, true);
-    }
-  }
-  public class BufferedTable : TableLayoutPanel {
-    public BufferedTable() {
-      this.DoubleBuffered = true;
-      this.SetStyle(ControlStyles.ResizeRedraw, true);
-    }
-  }
-}
-"@
-}
-function New-CardPanel { Ensure-DashTypes; return New-Object Vulcan.CardPanel }
-function New-BufferedTable { Ensure-DashTypes; return New-Object Vulcan.BufferedTable }
-# A rounded card: a panel that paints a rounded filled rect (anti-aliased).
-function New-Card([int]$w, [int]$h, $color) {
-    $p = New-CardPanel
-    $p.Size = New-Object System.Drawing.Size($w, $h)
-    $p.BackColor = $script:DashTheme.Bg
-    $p.Tag = @{ Color = $color; Radius = 14 }
-    $p.Add_Paint({
-        param($s, $e)
-        try {
-            $c = $this
-            $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-            $br = New-Object System.Drawing.SolidBrush $c.Tag.Color
-            $w = [int]$c.Width; $h = [int]$c.Height
-            Fill-Round $e.Graphics $br (New-Object System.Drawing.Rectangle(0, 0, ($w - 1), ($h - 1))) $c.Tag.Radius
-            $br.Dispose()
-        } catch { WLog "paint card: $($_.Exception.Message)" }
-    })
-    return $p
-}
-function New-Lbl($text, $font, $fore, $back, [int]$x, [int]$y) {
-    $l = New-Object System.Windows.Forms.Label
-    $l.Text = $text; $l.Font = $font; $l.ForeColor = $fore; $l.BackColor = $back
-    $l.AutoSize = $true; $l.Location = New-Object System.Drawing.Point($x, $y)
-    return $l
-}
-# Draw a pill toggle into a panel given an on/off state.
-function Draw-Toggle($g, $panel, [bool]$on) {
-    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-    $g.Clear($panel.BackColor)
-    $pw = [int]$panel.Width; $ph = [int]$panel.Height
-    $track = [System.Drawing.Color]::FromArgb(74,78,90)
-    if ($on) { $track = $script:DashTheme.Good }
-    $br = New-Object System.Drawing.SolidBrush $track
-    Fill-Round $g $br (New-Object System.Drawing.Rectangle(0, 0, ($pw - 1), ($ph - 1))) ([int]($ph/2))
-    $br.Dispose()
-    $kd = $ph - 8
-    $kx = 4
-    if ($on) { $kx = $pw - $kd - 4 }
-    $g.FillEllipse([System.Drawing.Brushes]::White, $kx, 4, $kd, $kd)
-}
-function Restyle-Seg($btns, $current, $accent) {
-    foreach ($b in $btns) {
-        if ([int]$b.Tag -eq [int]$current) { $b.BackColor = $accent; $b.ForeColor = [System.Drawing.Color]::White }
-        else { $b.BackColor = $script:DashTheme.Card2; $b.ForeColor = $script:DashTheme.Muted }
-    }
-}
-function New-DashButton($text, $accent, $fore=$null) {
-    $b = New-Object System.Windows.Forms.Button
-    $b.Text = $text; $b.Font = DashFont 9.5 'Bold'; $b.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-    $b.FlatAppearance.BorderSize = 0; $b.BackColor = $accent
-    $b.ForeColor = if ($fore) { $fore } else { [System.Drawing.Color]::White }
-    $b.Size = New-Object System.Drawing.Size(150, 38); $b.Cursor = [System.Windows.Forms.Cursors]::Hand
-    return $b
-}
-function New-DashSwitch([int]$x, [int]$y) {
-    $t = New-CardPanel
-    $t.Size = New-Object System.Drawing.Size(46, 24); $t.Location = New-Object System.Drawing.Point($x, $y)
-    $t.BackColor = $script:DashTheme.Bg; $t.Cursor = [System.Windows.Forms.Cursors]::Hand
-    return $t
-}
-# Build a segmented selector into $panel; returns its buttons. $setBlock is the
-# (script-scope) click handler attached to each option button.
-function New-DashSeg($panel, $label, [int]$x, $options, $accent, $current, $setBlock) {
-    $T = $script:DashTheme
-    $panel.Controls.Add((New-Lbl $label (DashFont 9) $T.Muted $T.Bg $x 66))
-    $bx = $x + 116; $btns = @()
-    foreach ($o in $options) {
-        $b = New-Object System.Windows.Forms.Button
-        $b.Text = "$o"; $b.Tag = $o; $b.Font = DashFont 8.5 'Bold'
-        $b.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat; $b.FlatAppearance.BorderSize = 0
-        $b.Size = New-Object System.Drawing.Size(40, 28); $b.Location = New-Object System.Drawing.Point($bx, 62)
-        $b.Cursor = [System.Windows.Forms.Cursors]::Hand; $b.Add_Click($setBlock)
-        $panel.Controls.Add($b); $btns += $b; $bx += 44
-    }
-    Restyle-Seg $btns $current $accent
-    return $btns
-}
-# Choose X-axis tick spacing + label format from the visible span (in hours), so
-# ticks step through years / months / weeks / days / hours / minutes as you zoom.
-function Set-XGranularity($ax, [double]$spanH) {
-    $IT = [System.Windows.Forms.DataVisualization.Charting.DateTimeIntervalType]
-    if     ($spanH -gt 17520) { $ax.IntervalType = $IT::Years;   $ax.Interval = 1; $ax.LabelStyle.Format = 'yyyy' }      # > 2 years
-    elseif ($spanH -gt 2880)  { $ax.IntervalType = $IT::Months;  $ax.Interval = 1; $ax.LabelStyle.Format = 'MMM yyyy' }  # > 4 months
-    elseif ($spanH -gt 720)   { $ax.IntervalType = $IT::Weeks;   $ax.Interval = 1; $ax.LabelStyle.Format = 'MMM d' }     # > 30 days
-    elseif ($spanH -gt 96)    { $ax.IntervalType = $IT::Days;    $ax.Interval = 1; $ax.LabelStyle.Format = 'ddd d' }     # > 4 days
-    elseif ($spanH -gt 12)    { $ax.IntervalType = $IT::Hours;   $ax.Interval = 3; $ax.LabelStyle.Format = 'ddd HH:mm' }
-    elseif ($spanH -gt 2)     { $ax.IntervalType = $IT::Hours;   $ax.Interval = 1; $ax.LabelStyle.Format = 'HH:mm' }
-    elseif ($spanH -gt 0.5)   { $ax.IntervalType = $IT::Minutes; $ax.Interval = 10; $ax.LabelStyle.Format = 'HH:mm' }
-    else                      { $ax.IntervalType = $IT::Minutes; $ax.Interval = 1; $ax.LabelStyle.Format = 'HH:mm:ss' }
-}
-function Update-Granularity($chart) {
-    if (-not $chart -or $chart.ChartAreas.Count -eq 0) { return }
-    try {
-        $ax = $chart.ChartAreas['main'].AxisX
-        $sv = $ax.ScaleView
-        $r = Get-ChartXRange $chart
-        if ($r.Count -lt 2) { return }
-        if ($sv.IsZoomed) { $spanH = ($sv.ViewMaximum - $sv.ViewMinimum) * 24 }
-        else { $spanH = ($r.Max - $r.Min) * 24 }
-        if ($spanH -le 0) { $spanH = 1 }
-        Set-XGranularity $ax $spanH
-    } catch {}
-}
-
-function Update-Dash-Controls {
-    if (-not ($script:dash -and $script:dash.Form -and -not $script:dash.Form.IsDisposed)) { return }
-    foreach ($t in @($script:dash.ConnTog, $script:dash.AranetTog, $script:dash.LogTog, $script:dash.StartupTog)) { if ($t) { $t.Invalidate() } }
-    Restyle-Seg $script:dash.ClockBtns ([int]$script:settings.IntervalMinutes) $script:DashTheme.Temp
-    Restyle-Seg $script:dash.AranetBtns ([int]$script:settings.AranetIntervalMinutes) $script:DashTheme.Co2
-}
-
-# ======================= ROOM STATE DASHBOARD =======================
-# A verdict-led "inference layer": the screen leads with one plain-language
-# read of the room, then quiet cards that each answer a human question. Calm
-# by default - one accent, semantic colour only as small dots / bands / words.
-$script:RsDeg=[char]0x00B0; $script:RsMid=[char]0x00B7; $script:RsNd=[char]0x2013; $script:RsEm=[char]0x2014
-$script:RsSub2=[char]0x2082; $script:RsSup3=[char]0x00B3
-$script:RsUp=[char]0x2191; $script:RsDn=[char]0x2193; $script:RsRt=[char]0x2192
-$script:RsDR=[char]0x2198; $script:RsUR=[char]0x2197; $script:RsBul=[char]0x25CF
-$script:RsFonts = $null
-
-function Build-Theme($mode) {
-    if ($mode -eq 'light') {
-        $t = @{ Mode='light'
-          Canvas=[Drawing.Color]::FromArgb(246,246,243); Surface=[Drawing.Color]::FromArgb(255,255,255); Sunken=[Drawing.Color]::FromArgb(240,240,236)
-          TextP=[Drawing.Color]::FromArgb(21,22,26); TextS=[Drawing.Color]::FromArgb(92,94,102); TextT=[Drawing.Color]::FromArgb(138,140,148)
-          Hairline=[Drawing.Color]::FromArgb(18,20,22,26); Accent=[Drawing.Color]::FromArgb(15,158,142); AccentWash=[Drawing.Color]::FromArgb(20,15,158,142)
-          Caution=[Drawing.Color]::FromArgb(193,138,46); Alert=[Drawing.Color]::FromArgb(192,87,59) }
-    } else {
-        $t = @{ Mode='dark'
-          Canvas=[Drawing.Color]::FromArgb(13,14,16); Surface=[Drawing.Color]::FromArgb(23,24,27); Sunken=[Drawing.Color]::FromArgb(30,31,35)
-          TextP=[Drawing.Color]::FromArgb(244,244,241); TextS=[Drawing.Color]::FromArgb(162,164,172); TextT=[Drawing.Color]::FromArgb(110,112,119)
-          Hairline=[Drawing.Color]::FromArgb(20,255,255,255); Accent=[Drawing.Color]::FromArgb(43,182,164); AccentWash=[Drawing.Color]::FromArgb(26,43,182,164)
-          Caution=[Drawing.Color]::FromArgb(214,162,74); Alert=[Drawing.Color]::FromArgb(215,122,92) }
-    }
-    # legacy aliases so the existing control widgets keep working unchanged
-    $t.Bg=$t.Canvas; $t.Card=$t.Surface; $t.Card2=$t.Sunken; $t.Border=$t.Hairline
-    $t.Text=$t.TextP; $t.Muted=$t.TextS; $t.Good=$t.Accent; $t.Warn=$t.Caution; $t.Bad=$t.Alert
-    $t.Temp=$t.Accent; $t.Hum=$t.Accent; $t.Co2=$t.Accent; $t.Pres=$t.Accent; $t.Batt=$t.Accent
-    return $t
-}
-function Apply-Theme($mode) { $script:DashTheme = Build-Theme $mode }
-function Ensure-RsFonts {
-    if ($script:RsFonts) { return }
-    $script:RsFonts = @{
-        Verdict = New-Object Drawing.Font('Segoe UI Semibold', 24)
-        Title   = New-Object Drawing.Font('Segoe UI Semibold', 12)
-        Value   = New-Object Drawing.Font('Segoe UI Semibold', 21)
-        Big     = New-Object Drawing.Font('Segoe UI Semibold', 27)
-        Unit    = New-Object Drawing.Font('Segoe UI', 9.5)
-        Body    = New-Object Drawing.Font('Segoe UI', 9.5)
-        Caption = New-Object Drawing.Font('Segoe UI', 8)
-        Arrow   = New-Object Drawing.Font('Segoe UI Semibold', 17)
-    }
-}
-# ---- draw primitives ----
-function Rs-Fill($g, $color, [int]$x, [int]$y, [int]$w, [int]$h, [int]$r) {
-    if ($w -le 0 -or $h -le 0) { return }
-    $gp = New-Object Drawing.Drawing2D.GraphicsPath
-    $d = $r * 2; if ($d -gt $w) { $d = $w }; if ($d -gt $h) { $d = $h }; if ($d -lt 1) { $d = 1 }
-    $gp.AddArc($x, $y, $d, $d, 180, 90); $gp.AddArc($x+$w-$d, $y, $d, $d, 270, 90)
-    $gp.AddArc($x+$w-$d, $y+$h-$d, $d, $d, 0, 90); $gp.AddArc($x, $y+$h-$d, $d, $d, 90, 90); $gp.CloseFigure()
-    $b = New-Object Drawing.SolidBrush $color; $g.FillPath($b, $gp); $b.Dispose(); $gp.Dispose()
-}
-function Rs-Stroke($g, $color, [int]$x, [int]$y, [int]$w, [int]$h, [int]$r) {
-    if ($w -le 0 -or $h -le 0) { return }
-    $gp = New-Object Drawing.Drawing2D.GraphicsPath
-    $d = $r * 2; if ($d -lt 1) { $d = 1 }
-    $gp.AddArc($x, $y, $d, $d, 180, 90); $gp.AddArc($x+$w-$d, $y, $d, $d, 270, 90)
-    $gp.AddArc($x+$w-$d, $y+$h-$d, $d, $d, 0, 90); $gp.AddArc($x, $y+$h-$d, $d, $d, 90, 90); $gp.CloseFigure()
-    $pen = New-Object Drawing.Pen($color, 1); $g.DrawPath($pen, $gp); $pen.Dispose(); $gp.Dispose()
-}
-function Rs-Txt($g, $text, $font, $color, $x, $y) {
-    $b = New-Object Drawing.SolidBrush $color; $g.DrawString([string]$text, $font, $b, [single]$x, [single]$y); $b.Dispose()
-}
-function Rs-TxtR($g, $text, $font, $color, $x, $y, $w) {
-    $sf = New-Object Drawing.StringFormat; $sf.Alignment = [Drawing.StringAlignment]::Far
-    $b = New-Object Drawing.SolidBrush $color
-    $g.DrawString([string]$text, $font, $b, (New-Object Drawing.RectangleF($x, $y, $w, 40)), $sf); $b.Dispose()
-}
-function Rs-Meas($g, $text, $font) { $g.MeasureString([string]$text, $font) }
-function Rs-CardBg($g, $p, $T) {
-    $g.SmoothingMode = [Drawing.Drawing2D.SmoothingMode]::AntiAlias
-    $g.TextRenderingHint = [Drawing.Text.TextRenderingHint]::ClearTypeGridFit
-    $g.Clear($T.Canvas)
-    Rs-Fill $g $T.Surface 0 0 ($p.Width-1) ($p.Height-1) 18
-    Rs-Stroke $g $T.Hairline 0 0 ($p.Width-1) ($p.Height-1) 18
-}
-function Rs-Spark($g, $pts, [int]$x, [int]$y, [int]$w, [int]$h, $T) {
-    if (-not $pts -or @($pts).Count -lt 2) { return }
-    $pts = @($pts); $mn = ($pts | Measure-Object -Minimum).Minimum; $mx = ($pts | Measure-Object -Maximum).Maximum
-    $rng = $mx - $mn; if ($rng -le 0) { $rng = 1 }
-    $n = $pts.Count; $dx = $w / [double]($n-1)
-    $poly = New-Object 'System.Collections.Generic.List[System.Drawing.PointF]'
-    for ($i=0; $i -lt $n; $i++) { $poly.Add((New-Object Drawing.PointF([single]($x+$i*$dx), [single]($y+$h-(([double]$pts[$i]-$mn)/$rng)*$h)))) }
-    $fp = New-Object 'System.Collections.Generic.List[System.Drawing.PointF]'; $fp.AddRange($poly)
-    $fp.Add((New-Object Drawing.PointF([single]($x+$w), [single]($y+$h)))); $fp.Add((New-Object Drawing.PointF([single]$x, [single]($y+$h))))
-    $fb = New-Object Drawing.SolidBrush $T.AccentWash; $g.FillPolygon($fb, $fp.ToArray()); $fb.Dispose()
-    $pen = New-Object Drawing.Pen($T.Accent, 1.5); $pen.LineJoin=[Drawing.Drawing2D.LineJoin]::Round; $g.DrawLines($pen, $poly.ToArray()); $pen.Dispose()
-}
-function Rs-Band($g, [int]$x, [int]$y, [int]$w, [int]$h, $min, $max, $zones, $value, $T) {
-    Rs-Fill $g $T.Sunken $x $y $w $h ([int]($h/2))
-    $span = $max - $min; if ($span -le 0) { $span = 1 }
-    foreach ($z in $zones) {
-        $zx = $x + (([double]$z.Lo-$min)/$span)*$w; $zw = (([double]$z.Hi-[double]$z.Lo)/$span)*$w
-        if ($zw -lt 1) { continue }
-        $tint = [Drawing.Color]::FromArgb(40, $z.Col.R, $z.Col.G, $z.Col.B)
-        Rs-Fill $g $tint ([int]$zx) $y ([int]$zw) $h ([int]($h/2))
-    }
-    if ($null -ne $value) {
-        $v = [double]$value; if ($v -lt $min) { $v = $min }; if ($v -gt $max) { $v = $max }
-        $mx = $x + (($v-$min)/$span)*$w
-        $mb = New-Object Drawing.SolidBrush $T.TextP
-        $g.FillRectangle($mb, [single]($mx-1.5), [single]($y-3), [single]3, [single]($h+6)); $mb.Dispose()
-    }
-}
-function Rs-Person($g, [int]$cx, [int]$top, [int]$size, $color) {
-    $pen = New-Object Drawing.Pen($color, 1.5); $pen.LineJoin=[Drawing.Drawing2D.LineJoin]::Round
-    $hd = [int]($size*0.34)
-    $g.DrawEllipse($pen, ($cx-$hd/2), $top, $hd, $hd)
-    $bx = $cx-$size/2+$size*0.12; $bw = $size-$size*0.24; $by = $top+$hd+2; $bh = $size-$hd-2
-    $g.DrawArc($pen, [single]$bx, [single]$by, [single]$bw, [single]($bh*2), 180, 180); $pen.Dispose()
-}
-function Rs-Icon($g, $name, [int]$x, [int]$y, [int]$s, $color) {
-    $pen = New-Object Drawing.Pen($color, 1.5); $pen.StartCap='Round'; $pen.EndCap='Round'; $pen.LineJoin='Round'
-    switch ($name) {
-        'temp' { $g.DrawArc($pen,($x+$s*0.28),$y,($s*0.44),($s*0.44),0,360); $g.DrawLine($pen,($x+$s*0.5),($y+$s*0.18),($x+$s*0.5),($y+$s*0.62)) }
-        'drop' { $g.DrawArc($pen,($x+$s*0.2),($y+$s*0.3),($s*0.6),($s*0.6),30,300); $g.DrawLine($pen,($x+$s*0.5),($y+$s*0.05),($x+$s*0.22),($y+$s*0.45)); $g.DrawLine($pen,($x+$s*0.5),($y+$s*0.05),($x+$s*0.78),($y+$s*0.45)) }
-        'air'  { $g.DrawArc($pen,($x+$s*0.1),($y+$s*0.25),($s*0.5),($s*0.3),90,260); $g.DrawLine($pen,($x+$s*0.1),($y+$s*0.4),($x+$s*0.75),($y+$s*0.4)) }
-        'gauge'{ $g.DrawArc($pen,($x+$s*0.1),($y+$s*0.2),($s*0.8),($s*0.8),180,180); $g.DrawLine($pen,($x+$s*0.5),($y+$s*0.6),($x+$s*0.7),($y+$s*0.35)) }
-    }
-    $pen.Dispose()
-}
-# ---- inference helpers ----
-function Rs-AbsHum([double]$t, [double]$rh) { [Math]::Round((6.112*[Math]::Exp((17.67*$t)/($t+243.5))*$rh*2.1674)/(273.15+$t), 1) }
-function Rs-Rebreathed([double]$co2) { $r = ($co2-420)/(40000-420)*100; if ($r -lt 0) { $r = 0 }; [Math]::Round($r,1) }
-function Rs-Recent($series, [double]$hours) {
-    $cut = (Get-Date).AddHours(-$hours); $out = New-Object System.Collections.Generic.List[object]
-    foreach ($x in $series) { if ($x.T -ge $cut) { $out.Add($x) } }
-    return $out
-}
-function Rs-Down($arr, [int]$n) {
-    $arr = @($arr); if ($arr.Count -le $n) { return $arr }
-    $out = @(); $step = $arr.Count/[double]$n
-    for ($i=0; $i -lt $n; $i++) { $out += $arr[[int]($i*$step)] }
-    $out += $arr[$arr.Count-1]; return $out
-}
-function Rs-Delta($series, $prop, $cur, [double]$hours) {
-    if ($null -eq $cur) { return 0 }
-    $s = Rs-Recent $series $hours; if ($s.Count -lt 1) { return 0 }
-    return ($cur - [double]$s[0].$prop)
-}
-# Headcount from a CO2 mass balance:  generation (n people) = ventilation removal
-#   n = ACH * V * (C - C_outdoor) / (1e6 * G)
-# where V = room volume (m3), ACH = air changes/hour (estimated from CO2 decay,
-# falling back to a typical value), G = per-person CO2 output (~0.0186 m3/h at
-# rest), C_outdoor ~ 420 ppm. Room volume comes from the RoomVolume setting -
-# without it people and volume can't be separated from a single CO2 reading.
-# The raw count multiplies three uncertain inputs (estimated ACH, your room
-# volume, an assumed per-person CO2 output that varies ~2-3x), so we never claim
-# an exact integer - we report a qualitative band (empty / 1-2 / several / crowd).
-function Rs-Occupancy($a, $ach=$null) {
-    if (-not $a) { return @{ Band='waiting for sensor'; Level=$null; Night=$false; Volume=$null } }
-    $co2 = [double]$a.Co2
-    $cout = 420.0
-    $s = Rs-Recent (Get-AranetSeries) 0.5; $slope = 0.0
-    if ($s.Count -ge 2) { $dt = ($s[$s.Count-1].T - $s[0].T).TotalHours; if ($dt -gt 0) { $slope = ([double]$s[$s.Count-1].Co2 - [double]$s[0].Co2)/$dt } }
-    $V = [double]$script:settings.RoomVolume; if ($V -le 0) { $V = 29 }
-    if ($null -eq $ach -or $ach -le 0) { $ach = 2.0 }   # assume a typical room when no decay seen
-    $G = 18600.0   # ppm-m3 per person-hour  (0.0186 m3/h CO2 * 1e6)
-    if ($co2 -lt ($cout + 60) -and $slope -lt 40) {
-        $n = 0
-    } else {
-        $nSteady = ($ach * $V * ($co2 - $cout)) / $G          # plateau case
-        $nRise   = ($slope * $V) / $G                          # freshly occupied, before ventilation catches up
-        $n = [Math]::Max($nSteady, $nRise * 0.6)
-        if ($n -lt 0.5 -and $co2 -gt ($cout + 80)) { $n = 1 }
-    }
-    if     ($n -lt 0.5) { $band = 'Empty';                          $lvl = 0 }
-    elseif ($n -lt 2.5) { $band = '1' + $script:RsNd + '2 people';  $lvl = 1 }
-    elseif ($n -lt 5.0) { $band = 'several people';                 $lvl = 2 }
-    else                { $band = 'a crowd';                        $lvl = 3 }
-    $h = (Get-Date).Hour
-    return @{ Band=$band; Level=$lvl; Night=($h -ge 23 -or $h -lt 6); Volume=[int]$V }
-}
-# Coarse ventilation band from the (uncertain) ACH estimate, home-appropriate.
-function Rs-AchBand($ach) {
-    if ($null -eq $ach)   { return @{ Band='estimating'; Level=-1 } }
-    if ($ach -lt 0.4)     { return @{ Band='Poor';     Level=0 } }
-    if ($ach -lt 1.2)     { return @{ Band='Moderate'; Level=1 } }
-    if ($ach -lt 4.0)     { return @{ Band='Good';     Level=2 } }
-    return @{ Band='Breezy'; Level=3 }
-}
-# Air changes/hour from the CO2 mass balance, generalised:
-#   dC/dt = G' - ACH*(C - C_out)
-# A least-squares line of dC/dt against (C - C_out) over a recent window gives
-# ACH = -slope (and the generation term G' = intercept) - so we measure airflow
-# from ANY varying CO2 (decaying, building toward a plateau, or mixed), not only
-# from a room emptying. Flat CO2 has no spread to fit (under-determined), so we
-# persist the last good value and keep showing it. A new fit that diverges from
-# the persisted one means ventilation changed (a window opened/closed).
-function Save-Ach { try { (@{ ach=$script:rsLastAch; at=$script:rsLastAchAt.ToString('s') } | ConvertTo-Json) | Set-Content -Path $AchFile -Encoding UTF8 } catch {} }
-function Load-Ach {
-    if (-not (Test-Path $AchFile)) { return }
-    try {
-        $j = Get-Content $AchFile -Raw | ConvertFrom-Json
-        if ($j.ach -and $j.at) { $when = [datetime]$j.at; if (((Get-Date)-$when).TotalHours -lt 6) { $script:rsLastAch = [double]$j.ach; $script:rsLastAchAt = $when } }
-    } catch {}
-}
-# Ordinary least-squares line y = a + slope*t; returns slope and R^2.
-function Rs-LinFit($xs, $ys) {
-    $n = $xs.Count; if ($n -lt 4) { return $null }
-    $mx=($xs|Measure-Object -Average).Average; $my=($ys|Measure-Object -Average).Average
-    $sxx=0.0; $sxy=0.0; $syy=0.0
-    for ($i=0;$i -lt $n;$i++){ $dx=$xs[$i]-$mx; $sxx+=$dx*$dx; $sxy+=$dx*($ys[$i]-$my); $syy+=[Math]::Pow($ys[$i]-$my,2) }
-    if ($sxx -le 0 -or $syy -le 0) { return $null }
-    $slope=$sxy/$sxx; $sse=0.0
-    for ($i=0;$i -lt $n;$i++){ $p=$my+$slope*($xs[$i]-$mx); $sse+=[Math]::Pow($ys[$i]-$p,2) }
-    return @{ Slope=$slope; R2=(1-$sse/$syy) }
-}
-# Exponential grid-fit C = Css + A*exp(-ach*t) for a buildup toward an unknown
-# plateau: 1-D search over ACH with a linear Css/A sub-fit (no differentiation, so
-# robust to noise). Rejects boundary / implausible-plateau (under-determined) fits.
-function Rs-GridFit($c, $tt, [double]$lastC) {
-    $n=$c.Count; $my=($c|Measure-Object -Average).Average; $sst=0.0; foreach($v in $c){$sst+=[Math]::Pow($v-$my,2)}
-    if ($sst -le 0) { return $null }
-    $best=$null; $bestErr=[double]::MaxValue; $bestCss=0.0
-    for ($A=0.2; $A -le 10; $A+=0.1) {
-        $u=New-Object 'System.Collections.Generic.List[double]'; $mu=0.0
-        for ($i=0;$i -lt $n;$i++){ $uu=[Math]::Exp(-$A*$tt[$i]); $u.Add($uu); $mu+=$uu }; $mu/=$n
-        $suu=0.0;$suc=0.0; for ($i=0;$i -lt $n;$i++){ $du=$u[$i]-$mu; $suu+=$du*$du; $suc+=$du*($c[$i]-$my) }
-        if ($suu -le 0) { continue }
-        $b=$suc/$suu; $aint=$my-$b*$mu; $err=0.0
-        for ($i=0;$i -lt $n;$i++){ $p=$aint+$b*$u[$i]; $err+=[Math]::Pow($c[$i]-$p,2) }
-        if ($err -lt $bestErr) { $bestErr=$err; $best=$A; $bestCss=$aint }
-    }
-    if ($null -eq $best) { return $null }
-    if ($best -le 0.25 -or $best -ge 9.85) { return $null }              # boundary -> can't pin
-    if ($bestCss -lt ($lastC+20) -or $bestCss -gt 4000) { return $null } # implausible plateau
-    if ((1 - $bestErr/$sst) -lt 0.85) { return $null }
-    return $best
-}
-function Rs-ACH($a) {
-    $cout = 420.0
-    $s = Rs-Recent (Get-AranetSeries) 3.0
-    $measured = $null
-    if ($s.Count -ge 6) {
-        $n = $s.Count
-        # 3-point smoothing to blunt sensor noise
-        $c = New-Object 'System.Collections.Generic.List[double]'
-        for ($i=0; $i -lt $n; $i++) {
-            $lo=[Math]::Max(0,$i-1); $hi=[Math]::Min($n-1,$i+1); $sum=0.0; $cnt=0
-            for ($j=$lo; $j -le $hi; $j++) { $sum += [double]$s[$j].Co2; $cnt++ }
-            $c.Add($sum/$cnt)
-        }
-        $t0=$s[0].T; $tt=New-Object 'System.Collections.Generic.List[double]'; for ($i=0;$i -lt $n;$i++){ $tt.Add((($s[$i].T-$t0).TotalHours)) }
-        # Real occupancy is messy (CO2 rises and falls), so don't require the whole
-        # window to trend one way. Scan for the cleanest DECAY segment (a peak down
-        # to a later trough) and fit ln(C-420) vs t over it (asymptote = outdoor).
-        $bestScore = 0.0
-        for ($i=0; $i -lt $n-3; $i++) {
-            if ($c[$i] -le $cout+60) { continue }
-            $jmin=-1; $cmin=[double]::MaxValue
-            for ($j=$i+1; $j -lt $n; $j++) { if ($c[$j] -lt $cmin) { $cmin=$c[$j]; $jmin=$j } }
-            if ($jmin -lt 0 -or ($c[$i]-$cmin) -lt 40) { continue }
-            $dur = $tt[$jmin]-$tt[$i]; if ($dur -lt 0.33) { continue }   # >= 20 min
-            $xs=New-Object 'System.Collections.Generic.List[double]'; $ys=New-Object 'System.Collections.Generic.List[double]'
-            for ($k=$i; $k -le $jmin; $k++) { if ($c[$k] -gt $cout+15) { $xs.Add($tt[$k]); $ys.Add([Math]::Log($c[$k]-$cout)) } }
-            if ($xs.Count -lt 4) { continue }
-            $fit = Rs-LinFit $xs $ys
-            if ($null -eq $fit) { continue }
-            $ach = -$fit.Slope
-            if ($ach -lt 0.15 -or $ach -gt 12 -or $fit.R2 -lt 0.6) { continue }
-            $score = $dur * $fit.R2
-            if ($score -gt $bestScore) { $bestScore = $score; $measured = $ach }
-        }
-        # fallback: a clean buildup toward a plateau (constrained exponential grid-fit)
-        if ($null -eq $measured) {
-            $cmn=($c|Measure-Object -Minimum).Minimum; $cmx=($c|Measure-Object -Maximum).Maximum
-            if (($cmx-$cmn) -ge 60 -and ($c[$n-1]-$c[0]) -gt 40) { $measured = Rs-GridFit $c $tt $c[$n-1] }
-        }
-    }
-    if ($null -ne $measured) {
-        $m = [Math]::Max(0.1, [Math]::Min(15, $measured))
-        if ($null -ne $script:rsLastAch -and ([Math]::Abs($m-$script:rsLastAch)/[Math]::Max(0.4,$script:rsLastAch)) -gt 0.6) { $script:rsAchChangedAt = (Get-Date) }
-        $script:rsLastAch = $m; $script:rsLastAchAt = (Get-Date); Save-Ach
-    }
-    $ach = $script:rsLastAch
-    if ($null -ne $script:rsLastAchAt -and ((Get-Date)-$script:rsLastAchAt).TotalHours -gt 6) { $ach = $null }   # too old to trust
-    $changed = ($null -ne $script:rsAchChangedAt -and ((Get-Date)-$script:rsAchChangedAt).TotalMinutes -le 20)
-    $ageMin = if ($null -ne $script:rsLastAchAt) { ((Get-Date)-$script:rsLastAchAt).TotalMinutes } else { $null }
-    $clear = 0
-    if ($a -and $null -ne $ach) { $cnow=[double]$a.Co2; if ($cnow -gt $cout+50) { $clear = [int]([Math]::Log(($cnow-$cout)/50.0)/$ach*60) } }
-    return @{ Ach=$(if ($null -ne $ach) { [Math]::Round($ach,1) } else { $null }); ClearMin=$clear; Fresh=($null -ne $measured); Changed=$changed; AgeMin=$ageMin }
-}
-function Rs-Pressure($a) {
-    if (-not $a) { return @{ Trend='steady'; Rate=0 } }
-    $s = Rs-Recent (Get-AranetSeries) 3.0; if ($s.Count -lt 2) { return @{ Trend='steady'; Rate=0 } }
-    $rate = [double]$a.Pres - [double]$s[0].Pres; $trend = 'steady'
-    if ($rate -le -0.6) { $trend = 'falling' } elseif ($rate -ge 0.6) { $trend = 'rising' }
-    return @{ Trend=$trend; Rate=[Math]::Round([Math]::Abs($rate),1) }
-}
-function Rs-Verdict($co2, $temp, $rh, $occ) {
-    if ($null -eq $co2 -and $null -eq $temp) { return @{ Line='Waiting for sensors.'; State='good' } }
-    $airState='good'; $airWord='Fresh'
-    if ($null -ne $co2) {
-        if ($co2 -lt 800) { $airWord='Fresh'; $airState='good' }
-        elseif ($co2 -lt 1200) { $airWord='Air is fine'; $airState='good' }
-        elseif ($co2 -lt 2000) { $airWord='Air getting stuffy'; $airState='caution' }
-        else { $airWord='Air is poor'; $airState='alert' }
-    }
-    $cWord='comfortable'; $cState='good'
-    if ($null -ne $temp -and $null -ne $rh) {
-        if ($temp -gt 26) { $cWord='a little warm'; $cState='caution' }
-        elseif ($temp -lt 17) { $cWord='a little cool'; $cState='caution' }
-        elseif ($rh -gt 65) { $cWord='a little humid'; $cState='caution' }
-        elseif ($rh -lt 30) { $cWord='a little dry'; $cState='caution' }
-    }
-    $state='good'; if ($airState -eq 'caution' -or $cState -eq 'caution') { $state='caution' }; if ($airState -eq 'alert') { $state='alert' }
-    $op=''
-    if ($occ.Level -eq 0) { $op='Empty' } elseif ($occ.Level -eq 1) { $op='Likely one or two people' }
-    elseif ($occ.Level -eq 2) { $op='Several people' } elseif ($occ.Level -eq 3) { $op='A crowd' }
-    $line = "$airWord and $cWord."; if ($op) { $line += " $op." }
-    return @{ Line=$line; State=$state }
-}
-function Rs-StateColor($state, $T) { if ($state -eq 'alert') { return $T.Alert }; if ($state -eq 'caution') { return $T.Caution }; return $T.Accent }
-
-# ---- motion + state infrastructure ----
-# Honour the OS "show animations" setting (and an explicit override). When true,
-# tweens and the breathing orb are disabled and changes apply instantly.
-function Rs-ReducedMotion {
-    if ($null -ne $script:settings.ReducedMotion) { return [bool]$script:settings.ReducedMotion }
-    try { return ([string](Get-ItemProperty 'HKCU:\Control Panel\Desktop\WindowMetrics' -Name MinAnimate -ErrorAction Stop).MinAnimate -eq '0') } catch { return $false }
-}
-$script:RsTypo = $null
-function Rs-Typo {
-    if (-not $script:RsTypo) { $script:RsTypo = [Drawing.StringFormat]::GenericTypographic.Clone(); $script:RsTypo.FormatFlags = $script:RsTypo.FormatFlags -bor [Drawing.StringFormatFlags]::MeasureTrailingSpaces }
-    return $script:RsTypo
-}
-# Draw a number with a fixed per-digit cell so figures are tabular (no jitter as
-# values tween, clean vertical scanning). Returns the drawn width.
-function Rs-Num($g, $text, $font, $color, [single]$x, [single]$y) {
-    $fmt = Rs-Typo; $text = [string]$text; $o = New-Object Drawing.PointF(0,0)
-    $cell = $g.MeasureString('0', $font, $o, $fmt).Width
-    $b = New-Object Drawing.SolidBrush $color; $cx = $x
-    foreach ($ch in $text.ToCharArray()) {
-        $s = [string]$ch; $w = $g.MeasureString($s, $font, $o, $fmt).Width
-        if ($ch -ge '0' -and $ch -le '9') { $g.DrawString($s, $font, $b, [single]($cx + ($cell-$w)/2), [single]$y, $fmt); $cx += $cell }
-        else { $g.DrawString($s, $font, $b, [single]$cx, [single]$y, $fmt); $cx += $w }
-    }
-    $b.Dispose(); return ($cx - $x)
-}
-# low-contrast skeleton block for the Loading state
-function Rs-Skeleton($g, $T, [int]$x, [int]$y, [int]$w, [int]$h) {
-    $c = if ($T.Mode -eq 'light') { [Drawing.Color]::FromArgb(18,20,22,26) } else { [Drawing.Color]::FromArgb(26,255,255,255) }
-    Rs-Fill $g $c $x $y $w $h 6
-}
-# tween state: target values + currently-displayed (eased) values
-$script:rsDisp = @{}; $script:rsTarget = @{}
-$script:rsVAlpha = 1.0; $script:rsPrevVerdict = ''; $script:rsSettle = @{}
-$script:rsLastAch = $null; $script:rsLastAchAt = $null; $script:rsAchChangedAt = $null   # persisted ventilation estimate
-function Rs-SetTargets($map) {
-    $reduced = Rs-ReducedMotion
-    foreach ($k in @($map.Keys)) {
-        $script:rsTarget[$k] = $map[$k]
-        if ($reduced -or -not $script:rsDisp.ContainsKey($k) -or $null -eq $map[$k] -or $null -eq $script:rsDisp[$k]) { $script:rsDisp[$k] = $map[$k] }
-    }
-}
-function Rs-Disp($k) { if ($script:rsDisp.ContainsKey($k) -and $null -ne $script:rsDisp[$k]) { return $script:rsDisp[$k] }; return $script:rsTarget[$k] }
-function Rs-AnimStep {
-    $moving = $false
-    foreach ($k in @($script:rsTarget.Keys)) {
-        $t = $script:rsTarget[$k]
-        if ($null -eq $t) { $script:rsDisp[$k] = $null; continue }
-        $d = $script:rsDisp[$k]
-        if ($null -eq $d) { $script:rsDisp[$k] = $t; continue }
-        $diff = $t - $d
-        if ([Math]::Abs($diff) -lt 0.05) { $script:rsDisp[$k] = $t } else { $script:rsDisp[$k] = $d + $diff * 0.22; $moving = $true }
-    }
-    return $moving
-}
-# Format a tweened metric for display from its eased value.
-function Rs-Fmt($key, $fmt) {
-    $v = Rs-Disp $key; if ($null -eq $v) { return $script:RsEm }
-    return ($fmt -f [double]$v)
-}
-
-# ---- component painters (read $script:rs) ----
 function Rs-PaintVerdict($g, $p) {
-    $T = $script:DashTheme; Ensure-RsFonts
-    $g.SmoothingMode='AntiAlias'; $g.TextRenderingHint='ClearTypeGridFit'; $g.Clear($T.Canvas)
-    if (-not $script:rs) { Rs-Skeleton $g $T 26 14 380 26; return }
-    $oc = Rs-StateColor $script:rs.State $T
-    $ph = $script:OrbPhase; $alpha = [int](115+140*$ph); $od = 13+1.0*$ph
-    $ob = New-Object Drawing.SolidBrush ([Drawing.Color]::FromArgb($alpha,$oc.R,$oc.G,$oc.B))
-    $g.FillEllipse($ob, [single]2, [single]15, [single]$od, [single]$od); $ob.Dispose()
-    # verdict word cross-fade: previous line fades out as the new one fades in
+    $T = $script:DashTheme; $F = $script:RsFonts; $Gx = [Vulcan.Gfx]
+    $Gx::Setup($g); $g.Clear($T.Canvas)
+    if (-not $script:rs) { $Gx::Fill($g, (Rs-Skel), 30, 12, 380, 26, 6); return }
     $fa = $script:rsVAlpha; if ($fa -lt 0) { $fa = 0 }; if ($fa -gt 1) { $fa = 1 }
+    $tw = $p.Width - 34
     if ($fa -lt 1 -and $script:rsPrevVerdict) {
-        $pc = [Drawing.Color]::FromArgb([int](255*(1-$fa)), $T.TextP.R, $T.TextP.G, $T.TextP.B)
-        Rs-Txt $g $script:rsPrevVerdict $script:RsFonts.Verdict $pc 26 7
+        $Gx::TextBox($g, $script:rsPrevVerdict, $F.Verdict, [System.Drawing.Color]::FromArgb([int](255*(1-$fa)), $T.TextP.R, $T.TextP.G, $T.TextP.B), 28, 0, $tw, 44, $false)
     }
-    $ncol = [Drawing.Color]::FromArgb([int](255*$fa), $T.TextP.R, $T.TextP.G, $T.TextP.B)
-    Rs-Txt $g $script:rs.Verdict $script:RsFonts.Verdict $ncol 26 7
-    $u = $script:rs.Updated.ToString('HH:mm'); Rs-Txt $g "updated $u  $($script:RsMid)  living room" $script:RsFonts.Caption $T.TextT 28 52
+    $Gx::TextBox($g, $script:rs.Verdict, $F.Verdict, [System.Drawing.Color]::FromArgb([int](255*$fa), $T.TextP.R, $T.TextP.G, $T.TextP.B), 28, 0, $tw, 44, $false)
+    # room name (click to rename) and when this was last worked out
+    $name = [string]$script:settings.RoomName; if (-not $name) { $name = 'Room' }
+    $x = 32; $y = 47
+    $nw = $Gx::Width($g, $name, $F.BodyB)
+    if (-not ($script:dash -and $script:dash.NameBox -and $script:dash.NameBox.Visible)) {
+        $Gx::Text($g, $name, $F.BodyB, $T.TextS, $x, $y)
+        $Gx::Text($g, $script:GlEdit, $F.Glyph, $T.TextT, ($x + $nw + 1), ($y + 4))
+    }
+    if ($script:dash) { $script:dash.NameRect = New-Object System.Drawing.Rectangle(($x - 4), ($y - 3), [int]($nw + 26), 26) }
+    $Gx::Text($g, ("$($script:RsMid)   updated " + $script:rs.Updated.ToString('HH:mm')), $F.Body, $T.TextT, ($x + $nw + 24), $y)
+}
+function Rs-PaintAlerts($g, $p) {
+    $T = $script:DashTheme; $F = $script:RsFonts; $Gx = [Vulcan.Gfx]
+    $Gx::Setup($g); $g.Clear($T.Canvas)
+    if (-not $script:rs -or $script:rs.Alerts.Count -eq 0) { return }
+    $x = 0; $y = 2; $h = 32; $n = $script:rs.Alerts.Count; $i = 0
+    foreach ($al in $script:rs.Alerts) {
+        $col = $T.Caution; if ($al.Level -eq 'alert') { $col = $T.Alert } elseif ($al.Level -eq 'info') { $col = $T.TextS }
+        $tw = $Gx::Width($g, $al.Title, $F.BodyB); $mw = $Gx::Width($g, $al.Msg, $F.Body)
+        $avail = $p.Width - $x
+        if ($avail -lt (30 + $tw + 16)) { $Gx::Text($g, "+$($n - $i) more", $F.Body, $T.TextT, ($x + 2), ($y + 7)); break }
+        $w = [Math]::Min((30 + $tw + 6 + $mw + 16), $avail)
+        $Gx::Fill($g, [System.Drawing.Color]::FromArgb(30, $col.R, $col.G, $col.B), $x, $y, $w, $h, 16)
+        $Gx::Stroke($g, [System.Drawing.Color]::FromArgb(90, $col.R, $col.G, $col.B), $x, $y, $w, $h, 16)
+        $Gx::Dot($g, $col, ($x + 12), ($y + 12), 8)
+        $Gx::Text($g, $al.Title, $F.BodyB, $T.TextP, ($x + 26), ($y + 7))
+        $Gx::TextBox($g, $al.Msg, $F.Body, $T.TextS, ($x + 26 + $tw + 4), ($y + 7), ($w - (26 + $tw + 4) - 10), 20, $false)
+        $x += $w + 10; $i++
+    }
 }
 function Rs-PaintVital($g, $p) {
-    $T = $script:DashTheme; Ensure-RsFonts; Rs-CardBg $g $p $T
+    $T = $script:DashTheme; $F = $script:RsFonts; $Gx = [Vulcan.Gfx]
+    $Gx::Card($g, $p.Width, $p.Height, 16)
     $pad = 16
-    if (-not $script:rs) { Rs-Skeleton $g $T $pad ($pad+28) 84 26; return }
+    if (-not $script:rs) { $Gx::Fill($g, (Rs-Skel), $pad, ($pad+28), 84, 26, 6); return }
     $d = $script:rs.V[$p.Tag.Key]; if (-not $d) { return }
     Rs-Icon $g $d.Icon $pad ($pad+1) 18 $T.TextT
-    Rs-Txt $g $d.Label $script:RsFonts.Body $T.TextS ($pad+26) ($pad+1)
+    $Gx::Text($g, $d.Label, $F.Body, $T.TextS, ($pad+24), $pad)
+    if ($d.Note) { $Gx::TextRight($g, $d.Note, $F.Caption, $T.TextT, $pad, ($pad+2), ($p.Width-2*$pad)) }
     if ($null -eq $d.Raw) {
-        Rs-Txt $g $script:RsEm $script:RsFonts.Value $T.TextT $pad ($pad+26)
-        Rs-Txt $g 'waiting for sensor' $script:RsFonts.Caption $T.TextT $pad ($pad+70)
+        $Gx::Text($g, [string]$script:RsEm, $F.Value, $T.TextT, $pad, ($pad+24))
+        $Gx::Text($g, 'waiting for sensor', $F.Caption, $T.TextT, $pad, ($p.Height-$pad-14))
         return
     }
-    $vcol = if ($d.Stale) { $T.TextT } else { $T.TextP }
-    $vtxt = Rs-Fmt $d.DispKey $d.Fmt
-    $vw = Rs-Num $g $vtxt $script:RsFonts.Value $vcol $pad ($pad+26)
-    Rs-Txt $g $d.Unit $script:RsFonts.Unit $T.TextT ($pad+$vw+3) ($pad+44)
-    if ($d.Stale) {
-        Rs-Txt $g $d.AgeText $script:RsFonts.Caption $T.TextT $pad ($pad+70)
-    } elseif ($null -ne $d.Delta) {
-        $chev = $script:RsRt; if ($d.Delta -gt 0) { $chev = $script:RsUp } elseif ($d.Delta -lt 0) { $chev = $script:RsDn }
-        $dcol = if ($d.DeltaHot) { $T.Caution } else { $T.TextT }
-        Rs-Txt $g ("$chev " + [Math]::Abs($d.Delta) + $d.DUnit) $script:RsFonts.Caption $dcol $pad ($pad+70)
+    $vcol = $T.TextP; if ($d.Stale) { $vcol = $T.TextT }
+    $vw = $Gx::Num($g, (Rs-Fmt $d.DispKey $d.Fmt), $F.Value, $vcol, $pad, ($pad+24))
+    $Gx::Text($g, $d.Unit, $F.Unit, $T.TextT, ($pad+$vw+3), ($pad+41))
+    $cy = $p.Height - $pad - 14
+    if ($d.Stale) { $Gx::Text($g, ('last read ' + $d.AgeText), $F.Caption, $T.Caution, $pad, $cy) }
+    elseif ($null -ne $d.Delta) {
+        $dcol = $T.TextT; if ($d.Hot) { $dcol = $T.Caution }
+        if ($d.Delta -eq 0) { $Gx::Text($g, 'steady this hour', $F.Caption, $T.TextT, $pad, $cy) }
+        else {
+            $chev = $script:RsUp; if ($d.Delta -lt 0) { $chev = $script:RsDn }
+            $Gx::Text($g, ("$chev " + ($d.DFmt -f [Math]::Abs($d.Delta)) + $d.DUnit + ' in 1 h'), $F.Caption, $dcol, $pad, $cy)
+        }
     }
-    $sw = [int]($p.Width-$pad*2-58); if ($sw -lt 36) { $sw = 36 }
-    if ($d.Spark -and -not $d.Stale) { Rs-Spark $g $d.Spark ($p.Width-$pad-$sw) ($p.Height-$pad-22) $sw 22 $T }
+    $sw = [int]($p.Width*0.38); if ($sw -lt 40) { $sw = 40 }
+    if ($d.Spark -and $d.Spark.Length -ge 2 -and -not $d.Stale -and $p.Width -gt 190) { $Gx::Spark($g, $d.Spark, ($p.Width-$pad-$sw), ($pad+26), $sw, 28, $T.Accent, $T.AccentWash) }
 }
 function Rs-PaintAirQuality($g, $p) {
-    $T = $script:DashTheme; Ensure-RsFonts; Rs-CardBg $g $p $T
-    if (-not $script:rs) { Rs-Skeleton $g $T 22 46 150 34; return }
-    # settle bump: ripple this card briefly when the air state changes
+    $T = $script:DashTheme; $F = $script:RsFonts; $Gx = [Vulcan.Gfx]
+    $Gx::Card($g, $p.Width, $p.Height, 18)
+    if (-not $script:rs) { $Gx::Fill($g, (Rs-Skel), 22, 46, 150, 34, 6); return }
     $sp = 0.0; if ($script:rsSettle.ContainsKey('aq')) { $sp = $script:rsSettle['aq'] }
     $gs = $g.Save()
-    if ($sp -gt 0.01) { $sc = 1 + 0.035*[Math]::Sin($sp*[Math]::PI); $cx = $p.Width/2.0; $cy = $p.Height/2.0; $g.TranslateTransform($cx,$cy); $g.ScaleTransform($sc,$sc); $g.TranslateTransform(-$cx,-$cy) }
-    $pad = 22
-    Rs-Txt $g 'Air quality' $script:RsFonts.Title $T.TextP $pad ($pad-2)
-    $co2 = $script:rs.Co2
+    if ($sp -gt 0.01) { $sc = 1 + 0.03*[Math]::Sin($sp*[Math]::PI); $cx = $p.Width/2.0; $cy = $p.Height/2.0; $g.TranslateTransform($cx,$cy); $g.ScaleTransform($sc,$sc); $g.TranslateTransform(-$cx,-$cy) }
+    $pad = 22; $rs = $script:rs
+    $Gx::Text($g, 'Air quality', $F.Title, $T.TextP, $pad, ($pad-4))
+    $co2 = $rs.Co2
     if ($null -eq $co2) {
-        Rs-Txt $g $script:RsEm $script:RsFonts.Big $T.TextT $pad ($pad+22)
-        Rs-Txt $g 'waiting for sensor' $script:RsFonts.Body $T.TextT $pad ($pad+96)
+        $Gx::Text($g, [string]$script:RsEm, $F.Big, $T.TextT, $pad, ($pad+18))
+        $Gx::Text($g, 'Waiting for the Aranet4 to broadcast.', $F.Body, $T.TextT, $pad, ($p.Height-$pad-18))
         $g.Restore($gs); return
     }
-    $vcol = if ($script:rs.Co2Stale) { $T.TextT } else { $T.TextP }
-    $vtxt = Rs-Fmt 'co2' '{0:0}'
-    $vw = Rs-Num $g $vtxt $script:RsFonts.Big $vcol $pad ($pad+22)
-    Rs-Txt $g ('ppm CO'+$script:RsSub2) $script:RsFonts.Unit $T.TextT ($pad+$vw+4) ($pad+48)
-    $zones = @(@{Lo=400;Hi=800;Col=$T.Accent}, @{Lo=800;Hi=1200;Col=$T.TextT}, @{Lo=1200;Hi=2000;Col=$T.Caution}, @{Lo=2000;Hi=2200;Col=$T.Alert})
-    $by = $pad+80
-    Rs-Band $g $pad $by ($p.Width-$pad*2) 14 400 2200 $zones $co2 $T
-    Rs-Txt $g 'fresh' $script:RsFonts.Caption $T.TextT $pad ($by+20)
-    Rs-TxtR $g 'poor' $script:RsFonts.Caption $T.TextT $pad ($by+20) ($p.Width-$pad*2)
-    if ($script:rs.Co2Stale) {
-        Rs-Txt $g "last reading $($script:rs.Co2Age) $($script:RsMid) may be stale" $script:RsFonts.Body $T.TextT $pad ($by+42)
-    } else {
-        $rb = $script:rs.Rebreathed
-        $note = if ($co2 -lt 1000) { 'Decision-making likely sharp.' } elseif ($co2 -lt 1500) { 'Focus may start to dip.' } else { 'Open a window - focus suffers here.' }
-        Rs-Txt $g "~$rb% rebreathed air. $note" $script:RsFonts.Body $T.TextS $pad ($by+42)
+    $vcol = $T.TextP; if ($rs.Co2Stale) { $vcol = $T.TextT }
+    $vw = $Gx::Num($g, (Rs-Fmt 'co2' '{0:0}'), $F.Big, $vcol, $pad, ($pad+18))
+    $Gx::Text($g, ('ppm CO' + $script:RsSub2), $F.Unit, $T.TextT, ($pad+$vw+4), ($pad+43))
+    # how fast it is moving, on the right
+    $sl = NVal $rs.M.Co2Slope
+    if ($null -ne $sl -and -not $rs.Co2Stale -and [Math]::Abs($sl) -ge 60) {
+        $ch = $script:RsUp; $w = 'rising'; if ($sl -lt 0) { $ch = $script:RsDn; $w = 'falling' }
+        $scol = $T.TextS; if ($sl -gt 0 -and $co2 -ge 1000) { $scol = $T.Caution }
+        $Gx::TextRight($g, ("$ch $w {0:0} ppm an hour" -f [Math]::Abs($sl)), $F.Body, $scol, $pad, ($pad+42), ($p.Width-2*$pad))
+    }
+    $by = $pad + 70; $bw = $p.Width - $pad*2
+    $Gx::Band($g, $pad, $by, $bw, 12, 400, 2200, [double[]]@(400,800,1200,2000), [double[]]@(800,1200,2000,2200), [System.Drawing.Color[]]@($T.Accent,$T.TextT,$T.Caution,$T.Alert), [double]$co2)
+    $Gx::Text($g, 'fresh', $F.Caption, $T.TextT, $pad, ($by+17))
+    $Gx::TextRight($g, 'poor', $F.Caption, $T.TextT, $pad, ($by+17), $bw)
+    $ny = $p.Height - $pad - 16
+    if ($rs.Co2Stale) { $Gx::TextBox($g, ("Last measured $($rs.Co2Age). This may be out of date."), $F.Body, $T.Caution, $pad, $ny, $bw, 20, $false) }
+    else {
+        $note = 'Good for thinking.'
+        if ($co2 -ge 2000) { $note = 'Headaches and drowsiness are likely. Air the room.' }
+        elseif ($co2 -ge 1400) { $note = 'Concentration suffers at this level. Open a window.' }
+        elseif ($co2 -ge 1000) { $note = 'Focus may start to dip.' }
+        $Gx::TextBox($g, ("About {0:0.0}% of each breath is air someone has already breathed. {1}" -f $rs.Rebreathed, $note), $F.Body, $T.TextS, $pad, $ny, $bw, 20, $false)
     }
     $g.Restore($gs)
 }
 function Rs-PaintOccupancy($g, $p) {
-    $T = $script:DashTheme; Ensure-RsFonts; Rs-CardBg $g $p $T
-    if (-not $script:rs) { Rs-Skeleton $g $T 20 46 120 26; return }
-    $pad = 20; $occ = $script:rs.Occ
-    Rs-Txt $g 'Occupancy' $script:RsFonts.Title $T.TextP $pad ($pad-2)
-    if ($null -eq $occ.Level) {
-        Rs-Txt $g 'waiting for sensor' $script:RsFonts.Body $T.TextT $pad ($pad+30)
-        return
-    }
-    # qualitative band as the headline (no exact integer is claimed)
-    Rs-Txt $g $occ.Band $script:RsFonts.Value $T.TextP $pad ($pad+24)
-    # a few representative person glyphs (faint, supportive of the band)
+    $T = $script:DashTheme; $F = $script:RsFonts; $Gx = [Vulcan.Gfx]
+    $Gx::Card($g, $p.Width, $p.Height, 18)
+    if (-not $script:rs) { $Gx::Fill($g, (Rs-Skel), 20, 46, 120, 26, 6); return }
+    $pad = 20; $occ = $script:rs.Occ; $w = $p.Width - 2*$pad
+    $Gx::Text($g, 'Occupancy', $F.Title, $T.TextP, $pad, ($pad-4))
+    if ($null -eq $occ.Level) { $Gx::Text($g, 'Waiting for the Aranet4.', $F.Body, $T.TextT, $pad, ($pad+28)); return }
+    $Gx::Text($g, $occ.Band, $F.Value, $T.TextP, $pad, ($pad+20))
     $ng = @(0, 2, 3, 4)[$occ.Level]
-    for ($i=0; $i -lt $ng; $i++) { Rs-Person $g ($pad+10+$i*22) ($pad+62) 24 $T.TextS }
-    if ($occ.Night -and $occ.Level -ge 1) { Rs-Txt $g 'probably asleep' $script:RsFonts.Body $T.TextS $pad ($pad+96) }
-    $cap = "inferred from CO$($script:RsSub2) $($script:RsMid) $($occ.Volume) m$($script:RsSup3) room $($script:RsMid) no camera"
-    Rs-Txt $g $cap $script:RsFonts.Caption $T.TextT $pad ($p.Height-$pad-14)
+    for ($i = 0; $i -lt $ng; $i++) { Rs-Person $g ($pad+10+$i*22) ($pad+60) 22 $T.TextS }
+    $sub = ''
+    if ($occ.Held) { $sub = 'Airing now, so this is the count from just before.' }
+    elseif ($occ.Level -eq 0 -and $occ.Low) { $sub = 'At outdoor level: empty, or very well aired.' }
+    elseif ($occ.Night -and $occ.Level -ge 1) { $sub = 'Probably asleep.' }
+    if ($sub) { $sy = $pad + 88; if ($ng -eq 0) { $sy = $pad + 62 }; $Gx::TextBox($g, $sub, $F.Body, $T.TextS, $pad, $sy, $w, 20, $false) }
+    $Gx::TextBox($g, ("inferred from CO$($script:RsSub2)  $($script:RsMid)  $($occ.Volume) m$($script:RsSup3) room  $($script:RsMid)  no camera"), $F.Caption, $T.TextT, $pad, ($p.Height-$pad-14), $w, 16, $false)
 }
 function Rs-PaintVentilation($g, $p) {
-    $T = $script:DashTheme; Ensure-RsFonts; Rs-CardBg $g $p $T
+    $T = $script:DashTheme; $F = $script:RsFonts; $Gx = [Vulcan.Gfx]
+    $Gx::Card($g, $p.Width, $p.Height, 18)
     if (-not $script:rs) { return }
-    $pad = 20; $ach = $script:rs.Ach; $band = $script:rs.AchBand; $lvl = [int]$script:rs.AchLevel
-    Rs-Txt $g 'Ventilation' $script:RsFonts.Title $T.TextP $pad ($pad-2)
-    $bcol = if ($lvl -lt 0) { $T.TextT } else { $T.TextP }
-    Rs-Txt $g $band $script:RsFonts.Value $bcol $pad ($pad+24)
-    if ($lvl -ge 0) {
-        $bw = (Rs-Meas $g $band $script:RsFonts.Value).Width
-        Rs-Txt $g 'airflow' $script:RsFonts.Unit $T.TextT ($pad+$bw+6) ($pad+42)
+    $pad = 20; $rs = $script:rs; $M = $rs.M; $w = $p.Width - 2*$pad; $lvl = [int]$rs.AchLevel
+    $Gx::Text($g, 'Ventilation', $F.Title, $T.TextP, $pad, ($pad-4))
+    if ($rs.AchKind -eq 'live') { $tag = 'measuring now'; if ($rs.Airing) { $tag = 'airing now' }; $Gx::TextRight($g, $tag, $F.Caption, $T.Accent, $pad, ($pad-1), $w) }
+    elseif ($rs.AchKind -eq 'typical') { $Gx::TextRight($g, 'usual for this room', $F.Caption, $T.TextT, $pad, ($pad-1), $w) }
+    $bcol = $T.TextP; if ($lvl -lt 0) { $bcol = $T.TextT }
+    $Gx::Text($g, $rs.AchBand, $F.Value, $bcol, $pad, ($pad+20))
+    $by = $pad + 62; $seg = ($w - 3*6)/4.0
+    for ($i = 0; $i -lt 4; $i++) {
+        $col = $T.Sunken; if ($lvl -ge 0 -and $i -le $lvl) { $col = $T.Accent }
+        $Gx::Fill($g, $col, ($pad+$i*($seg+6)), $by, $seg, 6, 3)
     }
-    # 4-segment scale (poor -> breezy), filled up to the current band
-    $by = $pad+60; $tw = $p.Width-$pad*2; $seg = ($tw-3*6)/4.0
-    for ($i=0; $i -lt 4; $i++) {
-        $col = if ($lvl -ge 0 -and $i -le $lvl) { $T.Accent } else { $T.Sunken }
-        Rs-Fill $g $col ([int]($pad+$i*($seg+6))) $by ([int]$seg) 6 3
-    }
-    if ($null -ne $ach) {
-        # fresh fit -> show time-to-clear; remembered value -> show its age, honestly
-        if ($script:rs.AchFresh) {
-            $cm = [int]$script:rs.ClearMin
-            $clrTxt = if ($cm -gt 360) { 'slow to clear' } elseif ($cm -gt 120) { '~{0:0.0}h to clear' -f ($cm/60.0) } else { "~$cm min to clear" }
-            $clr = if ($cm -gt 0) { "  $($script:RsMid)  $clrTxt" } else { '' }
-            $sec = "$([char]0x2248)$('{0:0.0}' -f $ach) air changes/hour$clr"
-        } else {
-            $ageTxt = if ($null -ne $script:rs.AchAge) { Rs-AgeText ([double]$script:rs.AchAge) } else { 'earlier' }
-            $sec = "$([char]0x2248)$('{0:0.0}' -f $ach) ACH  $($script:RsMid)  measured $ageTxt"
-        }
-        Rs-Txt $g $sec $script:RsFonts.Body $T.TextS $pad ($by+16)
+    $line = ''; $cap = ''
+    if ($rs.AchKind -eq 'live') {
+        $line = "$($script:RsApx){0:0.0} air changes an hour" -f $rs.Ach
+        $fm = NVal $M.FreshenMin
+        if ($null -ne $fm -and $fm -ge 1) { if ($fm -gt 180) { $line += "  $($script:RsMid)  slow to clear" } else { $line += ("  $($script:RsMid)  fresh in ~{0:0} min" -f $fm) } }
+        $cap = "from the CO$($script:RsSub2) fall in progress"
+        if ($M.AchLiveOccupied) { $cap += ', with people still in the room' }
+    } elseif ($rs.AchKind -eq 'typical') {
+        $line = "$($script:RsApx){0:0.0} air changes an hour" -f $rs.Ach
+        $la = NVal $M.AchLast
+        if ($null -ne $la) { $line += ("  $($script:RsMid)  last measured {0:0.0}, {1}" -f $la, (Rs-AgeText $M.AchLastAgeMin)) }
+        $cap = "median of $($M.AchHistory) CO$($script:RsSub2) falls over 30 days"
+    } elseif ($rs.AchKind -eq 'last') {
+        $line = ("$($script:RsApx){0:0.0} air changes an hour, measured {1}" -f $rs.Ach, (Rs-AgeText $M.AchLastAgeMin))
+        $cap = "from one CO$($script:RsSub2) fall so far"
     } else {
-        Rs-Txt $g 'needs CO2 to vary (in or out) to estimate' $script:RsFonts.Body $T.TextT $pad ($by+16)
+        $line = "Needs CO$($script:RsSub2) to build up and then fall."
+        $cap = 'measured each time the room airs out or empties'
     }
-    $cap = 'estimated from CO2 dynamics'; $ccol = $T.TextT
-    if ($script:rs.AchChanged) { $cap = 'ventilation just changed'; $ccol = $T.Caution }
-    Rs-Txt $g $cap $script:RsFonts.Caption $ccol $pad ($p.Height-$pad-14)
+    $Gx::TextBox($g, $line, $F.Body, $T.TextS, $pad, ($by+16), $w, 20, $false)
+    $Gx::TextBox($g, $cap, $F.Caption, $T.TextT, $pad, ($p.Height-$pad-14), $w, 16, $false)
 }
 function Rs-PaintComfort($g, $p) {
-    $T = $script:DashTheme; Ensure-RsFonts; Rs-CardBg $g $p $T
+    $T = $script:DashTheme; $F = $script:RsFonts; $Gx = [Vulcan.Gfx]
+    $Gx::Card($g, $p.Width, $p.Height, 18)
     if (-not $script:rs) { return }
-    $pad = 20
-    Rs-Txt $g 'Comfort' $script:RsFonts.Title $T.TextP $pad ($pad-2)
-    if ($null -ne $script:rs.Dew) { $dw = Rs-Num $g (Rs-Fmt 'dew' '{0:0.0}') $script:RsFonts.Value $T.TextP $pad ($pad+24) }
-    else { $dw = Rs-Num $g $script:RsEm $script:RsFonts.Value $T.TextT $pad ($pad+24) }
-    Rs-Txt $g ($script:RsDeg+'C dew point') $script:RsFonts.Unit $T.TextT ($pad+$dw+4) ($pad+42)
-    $by = $pad+62; $zones = @(@{Lo=40;Hi=60;Col=$T.Accent})
-    Rs-Band $g $pad $by ($p.Width-$pad*2) 12 0 100 $zones $script:rs.Hum $T
-    if ($null -ne $script:rs.Hum -and $null -ne $script:rs.Abs) {
-        Rs-Txt $g ("$([int]$script:rs.Hum)% RH  $($script:RsMid)  $($script:rs.Abs) g/m"+$script:RsSup3+' absolute') $script:RsFonts.Body $T.TextS $pad ($by+18)
+    $pad = 20; $rs = $script:rs; $w = $p.Width - 2*$pad
+    $Gx::Text($g, 'Comfort', $F.Title, $T.TextP, $pad, ($pad-4))
+    if ($null -ne $rs.Dew) {
+        $feel = 'dry air'; if ($rs.Dew -ge 21) { $feel = 'oppressive' } elseif ($rs.Dew -ge 18) { $feel = 'muggy' } elseif ($rs.Dew -ge 13) { $feel = 'comfortable' } elseif ($rs.Dew -ge 8) { $feel = 'crisp' }
+        $Gx::TextRight($g, $feel, $F.Caption, $T.TextT, $pad, ($pad-1), $w)
+        $dw = $Gx::Num($g, (Rs-Fmt 'dew' '{0:0.0}'), $F.Value, $T.TextP, $pad, ($pad+20))
+    } else { $dw = $Gx::Num($g, [string]$script:RsEm, $F.Value, $T.TextT, $pad, ($pad+20)) }
+    $Gx::Text($g, ($script:RsDeg + 'C dew point'), $F.Unit, $T.TextT, ($pad+$dw+4), ($pad+37))
+    $by = $pad + 62
+    $Gx::Band($g, $pad, ($by-3), $w, 12, 0, 100, [double[]]@(40), [double[]]@(60), [System.Drawing.Color[]]@($T.Accent), (NNum $rs.Hum))
+    if ($null -ne $rs.Hum -and $null -ne $rs.Abs) {
+        $Gx::TextBox($g, ("{0:0}% RH  $($script:RsMid)  {1:0.0} g of water per m$($script:RsSup3)" -f $rs.Hum, $rs.Abs), $F.Body, $T.TextS, $pad, ($by+16), $w, 20, $false)
     }
-    Rs-Txt $g ('comfort band 40'+$script:RsNd+'60% RH') $script:RsFonts.Caption $T.TextT $pad ($p.Height-$pad-14)
+    $Gx::Text($g, ('comfort band 40' + $script:RsNd + '60% RH'), $F.Caption, $T.TextT, $pad, ($p.Height-$pad-14))
 }
 function Rs-PaintOutside($g, $p) {
-    $T = $script:DashTheme; Ensure-RsFonts; Rs-CardBg $g $p $T
+    $T = $script:DashTheme; $F = $script:RsFonts; $Gx = [Vulcan.Gfx]
+    $Gx::Card($g, $p.Width, $p.Height, 18)
     if (-not $script:rs) { return }
-    $pad = 20
-    Rs-Txt $g 'Outside' $script:RsFonts.Title $T.TextP $pad ($pad-2)
-    $tr = $script:rs.PresTrend; $arrow = $script:RsRt; if ($tr -eq 'falling') { $arrow = $script:RsDR } elseif ($tr -eq 'rising') { $arrow = $script:RsUR }
-    Rs-Txt $g $arrow $script:RsFonts.Arrow $T.TextP $pad ($pad+22)
-    Rs-Txt $g "$tr, $($script:rs.PresRate) hPa / 3h" $script:RsFonts.Body $T.TextS ($pad+34) ($pad+30)
-    $nc = if ($tr -eq 'falling') { 'Weather likely turning unsettled.' } elseif ($tr -eq 'rising') { 'Clearing and settling.' } else { 'Steady, little change expected.' }
-    Rs-Txt $g $nc $script:RsFonts.Body $T.TextS $pad ($pad+62)
-    Rs-Txt $g ("inferred from pressure  $($script:RsMid)  no outdoor sensor") $script:RsFonts.Caption $T.TextT $pad ($p.Height-$pad-14)
+    $pad = 20; $rs = $script:rs; $w = $p.Width - 2*$pad
+    $Gx::Text($g, 'Outside', $F.Title, $T.TextP, $pad, ($pad-4))
+    $arrow = $script:RsRt; if ($rs.PresDir -lt 0) { $arrow = $script:RsDR } elseif ($rs.PresDir -gt 0) { $arrow = $script:RsUR }
+    $acol = $T.TextP; if ($null -eq $rs.PresRate) { $acol = $T.TextT }
+    $Gx::Text($g, [string]$arrow, $F.Arrow, $acol, ($pad-2), ($pad+20))
+    $Gx::Text($g, $rs.PresTrend, $F.Value, $acol, ($pad+30), ($pad+20))
+    if ($null -ne $rs.PresRate) { $Gx::TextRight($g, ("{0:+0.0;-0.0} hPa in 3 h" -f $rs.PresRate), $F.Caption, $T.TextT, $pad, ($pad-1), $w) }
+    $Gx::TextBox($g, $rs.PresNote, $F.Body, $T.TextS, $pad, ($pad+78), $w, 20, $false)
+    $Gx::TextBox($g, ("pressure tendency  $($script:RsMid)  no outdoor sensor"), $F.Caption, $T.TextT, $pad, ($p.Height-$pad-14), $w, 16, $false)
 }
 function Rs-PaintTimeline($g, $p) {
-    $T = $script:DashTheme; Ensure-RsFonts; Rs-CardBg $g $p $T
-    if (-not $script:rs) { Rs-Skeleton $g $T 20 42 220 16; return }
-    $pad = 20
-    Rs-Txt $g 'Today' $script:RsFonts.Title $T.TextP $pad ($pad-2)
-    Rs-Txt $g ('CO'+$script:RsSub2+' and occupancy across the day') $script:RsFonts.Caption $T.TextT ($pad+58) ($pad+3)
-    # legend (top-right): accent = CO2 area, muted = occupancy
-    $lx = $p.Width - 196
-    if ($lx -gt $pad+220) {
-        $pa = New-Object Drawing.Pen($T.Accent,2.5); $g.DrawLine($pa, $lx, ($pad+7), ($lx+16), ($pad+7)); $pa.Dispose()
-        Rs-Txt $g ('CO'+$script:RsSub2) $script:RsFonts.Caption $T.TextT ($lx+21) ($pad-1)
-        $po = New-Object Drawing.Pen($T.TextT,1.5); $g.DrawLine($po, ($lx+74), ($pad+7), ($lx+90), ($pad+7)); $po.Dispose()
-        Rs-Txt $g 'people' $script:RsFonts.Caption $T.TextT ($lx+95) ($pad-1)
+    $T = $script:DashTheme; $F = $script:RsFonts; $Gx = [Vulcan.Gfx]
+    $Gx::Card($g, $p.Width, $p.Height, 18)
+    if (-not $script:rs) { $Gx::Fill($g, (Rs-Skel), 20, 42, 220, 16, 6); return }
+    $pad = 20; $M = $script:rs.M
+    $Gx::Text($g, 'Today', $F.Title, $T.TextP, $pad, ($pad-4))
+    $lx = $p.Width - 232
+    if ($lx -gt $pad + 70) {
+        $Gx::Line($g, $T.Accent, 2.5, $lx, ($pad+6), ($lx+16), ($pad+6), $false); $Gx::Text($g, ('CO' + $script:RsSub2), $F.Caption, $T.TextT, ($lx+21), ($pad-2))
+        $Gx::Line($g, $T.TextT, 1.5, ($lx+62), ($pad+6), ($lx+78), ($pad+6), $false); $Gx::Text($g, 'people (inferred)', $F.Caption, $T.TextT, ($lx+83), ($pad-2))
     }
-    $x = $pad; $y = $pad+32; $w = $p.Width-$pad*2; $h = $p.Height-$y-$pad-2
+    $x = $pad; $y = $pad + 26; $w = $p.Width - $pad*2; $h = $p.Height - $y - $pad - 12
     if ($h -lt 16 -or $w -lt 60) { return }
-    $dayStart = (Get-Date).Date
-    # day/night shading driven by the clock (midnight-06:30 and 20:30-24h)
-    $nightB = New-Object Drawing.SolidBrush ([Drawing.Color]::FromArgb(16,120,130,160))
-    $g.FillRectangle($nightB, [single]$x, [single]$y, [single]($w*0.27), [single]$h)
-    $g.FillRectangle($nightB, [single]($x+$w*0.855), [single]$y, [single]($w*0.145), [single]$h); $nightB.Dispose()
-    $series = Rs-Recent ($script:rs.Timeline) 24.0
-    if ($series.Count -ge 2) {
-        $mn = 400.0; $mx = 900.0
-        foreach ($s in $series) { $c = [double]$s.Co2; if ($c -gt $mx) { $mx = $c }; if ($c -lt $mn) { $mn = $c } }
-        $rng = $mx-$mn; if ($rng -le 0) { $rng = 1 }
-        $co2poly = New-Object 'System.Collections.Generic.List[System.Drawing.PointF]'
-        $occpoly = New-Object 'System.Collections.Generic.List[System.Drawing.PointF]'
-        $prevOcc = $null
-        foreach ($s in $series) {
-            $frac = ($s.T - $dayStart).TotalHours/24.0; if ($frac -lt 0) { $frac = 0 }; if ($frac -gt 1) { $frac = 1 }
-            $px = $x+$frac*$w
-            $co2poly.Add((New-Object Drawing.PointF([single]$px, [single]($y+$h-(([double]$s.Co2-$mn)/$rng)*$h))))
-            $c = [double]$s.Co2; $oc = if ($c -lt 500) {0} elseif ($c -lt 700) {1} elseif ($c -lt 1000) {2} else {3}
-            $oy = $y+$h-($oc/3.0)*($h*0.5)
-            if ($null -ne $prevOcc) { $occpoly.Add((New-Object Drawing.PointF([single]$px, [single]$prevOcc))) }
-            $occpoly.Add((New-Object Drawing.PointF([single]$px, [single]$oy))); $prevOcc = $oy
-        }
-        $fp = New-Object 'System.Collections.Generic.List[System.Drawing.PointF]'; $fp.AddRange($co2poly)
-        $fp.Add((New-Object Drawing.PointF([single]$co2poly[$co2poly.Count-1].X, [single]($y+$h)))); $fp.Add((New-Object Drawing.PointF([single]$co2poly[0].X, [single]($y+$h))))
-        $fb = New-Object Drawing.SolidBrush $T.AccentWash; $g.FillPolygon($fb, $fp.ToArray()); $fb.Dispose()
-        if ($occpoly.Count -ge 2) { $po = New-Object Drawing.Pen($T.TextT,1.5); $g.DrawLines($po, $occpoly.ToArray()); $po.Dispose() }
-        $pen = New-Object Drawing.Pen($T.Accent,1.5); $pen.LineJoin='Round'; $g.DrawLines($pen, $co2poly.ToArray()); $pen.Dispose()
-        # "now" marker
-        $nx = $x + ((((Get-Date)-$dayStart).TotalHours)/24.0)*$w
-        $np = New-Object Drawing.Pen($T.TextS,1); $np.DashStyle='Dot'; $g.DrawLine($np, [single]$nx, [single]$y, [single]$nx, [single]($y+$h)); $np.Dispose()
-        # scrub guide + readout
+    # night shading by the clock (00:00-06:30 and 20:30-24:00)
+    $nb = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(16,120,130,160))
+    $g.FillRectangle($nb, [single]$x, [single]$y, [single]($w*0.271), [single]$h)
+    $g.FillRectangle($nb, [single]($x+$w*0.854), [single]$y, [single]($w*0.146), [single]$h); $nb.Dispose()
+    foreach ($hh in 6, 12, 18) { $Gx::Line($g, $T.Hairline, 1, ($x+$w*$hh/24.0), $y, ($x+$w*$hh/24.0), ($y+$h), $false) }
+    if ($M.TlX.Length -ge 2) {
+        $scale = $Gx::Timeline($g, $M, $x, $y, $w, $h, $T.Accent, $T.AccentWash, $T.TextT)
+        $Gx::Text($g, ('{0:0} ppm' -f $scale[1]), $F.Caption, $T.TextT, ($x+3), ($y+1))
+        $nx = $x + (((Get-Date) - (Get-Date).Date).TotalHours/24.0)*$w
+        $Gx::Line($g, $T.TextS, 1, $nx, $y, $nx, ($y+$h), $true)
         if ($null -ne $script:rsScrubFrac) {
-            $sf = [double]$script:rsScrubFrac; if ($sf -lt 0) { $sf = 0 }; if ($sf -gt 1) { $sf = 1 }
-            $sx = $x+$sf*$w
-            $spn = New-Object Drawing.Pen($T.TextP,1); $g.DrawLine($spn, [single]$sx, [single]$y, [single]$sx, [single]($y+$h)); $spn.Dispose()
-            $best = $null; $bd = [double]::MaxValue
-            foreach ($s in $series) { $fr = ($s.T-$dayStart).TotalHours/24.0; $dd = [Math]::Abs($fr-$sf); if ($dd -lt $bd) { $bd = $dd; $best = $s } }
-            if ($best) { $lbl = "$($best.T.ToString('HH:mm'))   $([int]$best.Co2) ppm"; $tw = (Rs-Meas $g $lbl $script:RsFonts.Caption).Width; $lxp = $sx+6; if ($lxp+$tw -gt $x+$w) { $lxp = $sx-6-$tw }; Rs-Txt $g $lbl $script:RsFonts.Caption $T.TextP $lxp ($y+1) }
+            $i = $Gx::Nearest($M.TlX, [double]$script:rsScrubFrac)
+            if ($i -ge 0 -and [Math]::Abs($M.TlX[$i] - $script:rsScrubFrac) -lt 0.03) {
+                $sx = $x + $M.TlX[$i]*$w
+                $Gx::Line($g, $T.TextP, 1, $sx, $y, $sx, ($y+$h), $false)
+                $who = @('empty', ('1' + $script:RsNd + '2 people'), 'several people', 'a crowd')[$M.TlOcc[$i]]
+                $lbl = ((Get-Date).Date.AddDays($M.TlX[$i])).ToString('HH:mm') + ("   {0:0} ppm   " -f $M.TlCo2[$i]) + $who
+                $lw = $Gx::Width($g, $lbl, $F.Caption); $lxp = $sx + 6; if ($lxp + $lw -gt $x + $w) { $lxp = $sx - 6 - $lw }
+                $Gx::Fill($g, $T.Surface, ($lxp-3), ($y+14), ($lw+6), 16, 4)
+                $Gx::Text($g, $lbl, $F.Caption, $T.TextP, $lxp, ($y+15))
+            }
         }
-    } else {
-        Rs-Txt $g 'gathering today''s data' $script:RsFonts.Caption $T.TextT $x ($y+$h/2-6)
-    }
-    Rs-Txt $g '00:00' $script:RsFonts.Caption $T.TextT $x ($y+$h+1)
-    Rs-TxtR $g '24:00' $script:RsFonts.Caption $T.TextT $x ($y+$h+1) $w
+    } else { $Gx::Text($g, 'Gathering today''s readings.', $F.Body, $T.TextT, ($x+8), ($y+$h/2-8)) }
+    $ly = $y + $h + 2
+    $Gx::Text($g, '00:00', $F.Caption, $T.TextT, $x, $ly)
+    foreach ($hh in 6, 12, 18) { $Gx::Text($g, ('{0:00}:00' -f $hh), $F.Caption, $T.TextT, ($x+$w*$hh/24.0-14), $ly) }
+    $Gx::TextRight($g, '24:00', $F.Caption, $T.TextT, $x, $ly, $w)
 }
-function Rs-PaintFooter($g, $p) {
-    $T = $script:DashTheme; Ensure-RsFonts
-    $g.SmoothingMode='AntiAlias'; $g.TextRenderingHint='ClearTypeGridFit'; $g.Clear($T.Canvas)
-    $pen = New-Object Drawing.Pen($T.Hairline,1); $g.DrawLine($pen, 2, 0, ($p.Width-2), 0); $pen.Dispose()
+# Bottom-right of the action bar: quiet device status, replaced for a few seconds
+# by a message when a read finishes or something needs saying.
+function Rs-PaintStatus($g, $p) {
+    $T = $script:DashTheme; $F = $script:RsFonts; $Gx = [Vulcan.Gfx]
+    $Gx::Setup($g); $g.Clear($T.Canvas)
+    $w = $p.Width; $h = $p.Height
+    $note = $script:toast
+    if ($note) {
+        $acc = $T.Accent; if ($note.Kind -eq 'warn') { $acc = $T.Caution } elseif ($note.Kind -eq 'alert') { $acc = $T.Alert }
+        $bw = [Math]::Min($w - 8, 500); $bx = $w - $bw
+        $Gx::Fill($g, $T.Sunken, $bx, 4, ($bw-1), ($h-9), 12); $Gx::Stroke($g, $T.Hairline, $bx, 4, ($bw-1), ($h-9), 12)
+        $Gx::Dot($g, $acc, ($bx+14), 13, 8)
+        $Gx::Text($g, $note.Title, $F.Caption, $acc, ($bx+30), 8)
+        $Gx::TextBox($g, $note.Msg, $F.Body, $T.TextP, ($bx+30), 22, ($bw-42), ($h-28), $true)
+        return
+    }
     if (-not $script:rs) { return }
-    $cb = $script:rs.ClockBatt; $ab = $script:rs.AranetBatt
-    $cbt = if ($null -ne $cb) { "$cb%" } else { '--' }
-    $abt = if ($null -ne $ab) { "$ab%" } else { '--' }
-    $conn = if ($script:settings.ConnectionEnabled) { 'live' } else { 'paused' }
-    # show each device's last reading time so a fresh read is visible even when the
-    # value (slow-moving temperature / humidity) reads the same.
-    $clkT = if ($script:rs.ClockWhen) { $script:rs.ClockWhen.ToString('HH:mm') } else { '--' }
-    $airT = if ($script:rs.AranetWhen) { $script:rs.AranetWhen.ToString('HH:mm') } else { '--' }
-    $tx = 4
-    # a single caution dot only if a sensor has gone stale / offline
-    if ($script:rs.AnyStale -or -not $script:settings.ConnectionEnabled) {
-        $db = New-Object Drawing.SolidBrush $T.Caution; $g.FillEllipse($db, [single]4, [single]11, [single]7, [single]7); $db.Dispose(); $tx = 16
+    $rs = $script:rs; $S = $script:settings; $mid = "   $($script:RsMid)   "
+    $busy = Job-Active 'clock'
+    $l1 = 'Bluetooth off'; $dot = $T.TextT
+    if ($S.ConnectionEnabled) {
+        $dot = $T.Accent; if ($rs.AlertLevel -eq 'alert') { $dot = $T.Alert } elseif ($rs.AlertLevel -eq 'caution' -or $rs.Co2Stale -or $rs.EnvStale) { $dot = $T.Caution }
+        $ct = '--'; if ($rs.ClockWhen) { $ct = $rs.ClockWhen.ToString('HH:mm') }
+        $at = '--'; if ($rs.AranetWhen) { $at = $rs.AranetWhen.ToString('HH:mm') }
+        $l1 = "clock read $ct"; if ($busy) { $l1 = 'reading the clock...' }
+        if ($S.AranetEnabled) { $l1 += $mid + "CO$($script:RsSub2) measured $at" }
     }
-    $txt = "$conn   $($script:RsMid)   last read  clock $clkT $($script:RsMid) CO$($script:RsSub2) $airT   $($script:RsMid)   battery  clock $cbt $($script:RsMid) Aranet $abt"
-    Rs-Txt $g $txt $script:RsFonts.Caption $T.TextT $tx 8
+    $cb = '--'; if ($null -ne $rs.ClockBatt) { $cb = '{0:0}%' -f $rs.ClockBatt }
+    $abt = '--'; if ($null -ne $rs.AranetBatt) { $abt = '{0:0}%' -f $rs.AranetBatt }
+    $l2 = "battery: clock $cb, Aranet $abt"
+    if ($script:lastAranet -and $script:lastAranet.Interval -gt 0) { $l2 += $mid + "Aranet measures every $([int]($script:lastAranet.Interval/60)) min" }
+    $l1w = $Gx::Width($g, $l1, $F.Body)
+    $Gx::TextRight($g, $l1, $F.Body, $T.TextS, 0, 10, $w)
+    if ($w - $l1w - 18 -gt 0) { $Gx::Dot($g, $dot, ($w - $l1w - 14), 16, 7) }
+    $Gx::TextRight($g, $l2, $F.Caption, $T.TextT, 0, 31, $w)
 }
-# Notify the user: an in-window toast when the dashboard is open (so reads done
-# from the window surface in the window), else the tray balloon.
-function Rs-Toast($title, $msg, $kind) {
-    if ($script:dash -and $script:dash.Form -and -not $script:dash.Form.IsDisposed -and $script:dash.Toast -and -not $script:dash.Toast.IsDisposed) {
-        Ensure-RsFonts
-        $t = $script:dash.Toast; $f = $script:dash.Form
-        $t.Tag = @{ Title=[string]$title; Msg=[string]$msg; Kind=[string]$kind }
-        # sit in the empty right side of the controls strip (the bottom row), wrapped
-        $wide = 326; $wmax = $f.ClientSize.Width - 56; if ($wide -gt $wmax) { $wide = $wmax }
-        $gg = $t.CreateGraphics()
-        $ms = $gg.MeasureString([string]$msg, $script:RsFonts.Body, ($wide-46))
-        $gg.Dispose()
-        $th = [int]([Math]::Max(46, $ms.Height + 28))
-        $stripTop = $f.ClientSize.Height - 176                         # controls strip (150) + footer (26)
-        $t.Size = New-Object System.Drawing.Size([int]$wide, $th)
-        $t.Location = New-Object System.Drawing.Point([int]($f.ClientSize.Width-$wide-26), [int]($stripTop + (150-$th)/2))
-        $t.Visible = $true; $t.BringToFront(); $t.Invalidate()
-        if ($script:dash.ToastTimer) { $script:dash.ToastTimer.Stop(); $script:dash.ToastTimer.Start() }
-    } elseif ($script:ni) {
-        $icon = if ($kind -eq 'warn') { [System.Windows.Forms.ToolTipIcon]::Warning } else { [System.Windows.Forms.ToolTipIcon]::Info }
-        try { $script:ni.ShowBalloonTip(4000, [string]$title, [string]$msg, $icon) } catch {}
+function Rs-PaintDrawer($g, $p) {
+    $T = $script:DashTheme; $F = $script:RsFonts; $Gx = [Vulcan.Gfx]
+    $Gx::Setup($g); $g.Clear($T.Surface)
+    $Gx::Line($g, $T.Hairline, 1, 0, 0, 0, $p.Height, $false)
+    $Gx::Text($g, 'Settings', $F.Title, $T.TextP, 24, 20)
+    foreach ($l in $script:dash.DrawerLabels) {
+        if ($l.Kind -eq 'section') { $Gx::Text($g, $l.Text, $F.Section, $T.TextT, 24, $l.Y) }
+        elseif ($l.Kind -eq 'note') { $Gx::TextBox($g, $l.Text, $F.Caption, $T.TextT, 24, $l.Y, ($p.Width-48), 30, $true) }
+        else { $Gx::Text($g, $l.Text, $F.Body, $T.TextP, 24, $l.Y) }
     }
-}
-function Rs-PaintToast($g, $p) {
-    $T = $script:DashTheme; Ensure-RsFonts; $d = $p.Tag
-    $g.SmoothingMode='AntiAlias'; $g.TextRenderingHint='ClearTypeGridFit'; $g.Clear($T.Canvas)
-    $w=[int]$p.Width; $h=[int]$p.Height
-    Rs-Fill $g $T.Sunken 0 0 ($w-1) ($h-1) 12
-    Rs-Stroke $g $T.Hairline 0 0 ($w-1) ($h-1) 12
-    if (-not $d) { return }
-    $acc = if ($d.Kind -eq 'warn') { $T.Caution } else { $T.Accent }
-    $db = New-Object Drawing.SolidBrush $acc; $g.FillEllipse($db, [single]18, [single]15, [single]8, [single]8); $db.Dispose()
-    $my = 11
-    if ($d.Title) { Rs-Txt $g $d.Title $script:RsFonts.Caption $acc 36 $my; $my = 26 }
-    $mb = New-Object Drawing.SolidBrush $T.TextP
-    $g.DrawString([string]$d.Msg, $script:RsFonts.Body, $mb, (New-Object Drawing.RectangleF(36, $my, ($w-46), ($h-$my-4)))); $mb.Dispose()
 }
 
-# Hover popup: compact Room State summary (verdict + 4 readings + CO2 sparkline).
-function Update-PopupData {
-    $r = $script:lastReading; $a = $script:lastAranet
-    $temp = if ($r) { [double]$r.TempC } else { $null }
-    $hum  = if ($r) { [double]$r.Humidity } else { $null }
-    $co2  = if ($a) { [double]$a.Co2 } else { $null }
-    $pres = if ($a) { [double]$a.Pres } else { $null }
-    $occ = Rs-Occupancy $a; $vd = Rs-Verdict $co2 $temp $hum $occ
-    $spark = Rs-Down (@(Rs-Recent (Get-AranetSeries) 6.0 | ForEach-Object { [double]$_.Co2 })) 26
-    $script:popupData = @{ Verdict=$vd.Line; State=$vd.State; Temp=$temp; Hum=$hum; Co2=$co2; Pres=$pres; Spark=$spark }
+function Sync-DrawerControls {
+    if (-not ($script:dash -and $script:dash.Ctl)) { return }
+    $c = $script:dash.Ctl; $S = $script:settings
+    try {
+        $c.Conn.Checked = [bool]$S.ConnectionEnabled; $c.Aranet.Checked = [bool]$S.AranetEnabled; $c.Log.Checked = [bool]$S.HourlyLogging
+        $c.Alerts.Checked = [bool]$S.AlertsEnabled; $c.Quiet.Checked = [bool]$S.QuietNight
+        $c.Theme.Checked = ($script:DashTheme.Mode -eq 'light'); $c.Startup.Checked = [bool](Test-Startup)
+        $c.Seg.SelectedIndex = [Array]::IndexOf($script:ClockIvlOptions, (Clock-Interval))
+        if ($script:dash.Status) { $script:dash.Status.Invalidate() }
+    } catch {}
 }
-function Rs-PaintPopup($g, $p) {
-    $T = $script:DashTheme; Ensure-RsFonts
-    $g.SmoothingMode='AntiAlias'; $g.TextRenderingHint='ClearTypeGridFit'; $g.Clear($T.Canvas)
-    Rs-Fill $g $T.Surface 0 0 ($p.Width-1) ($p.Height-1) 16
-    Rs-Stroke $g $T.Hairline 0 0 ($p.Width-1) ($p.Height-1) 16
-    $d = $script:popupData
-    if (-not $d) { Rs-Txt $g 'waiting for sensors' $script:RsFonts.Body $T.TextT 18 18; return }
-    $oc = Rs-StateColor $d.State $T
-    $ob = New-Object Drawing.SolidBrush $oc; $g.FillEllipse($ob, [single]16, [single]18, [single]11, [single]11); $ob.Dispose()
-    $sf = New-Object Drawing.StringFormat; $sf.Trimming = [Drawing.StringTrimming]::EllipsisCharacter; $sf.FormatFlags = [Drawing.StringFormatFlags]::NoWrap
-    $vb = New-Object Drawing.SolidBrush $T.TextP; $g.DrawString($d.Verdict, $script:RsFonts.Title, $vb, (New-Object Drawing.RectangleF(34, 12, ($p.Width-48), 22)), $sf); $vb.Dispose()
-    $items = @(
-        @{ L='temp'; V=$(if ($null -ne $d.Temp) { ('{0:0.0}' -f $d.Temp)+$script:RsDeg } else { $script:RsEm }) },
-        @{ L='RH';   V=$(if ($null -ne $d.Hum)  { "$([int]$d.Hum)%" } else { $script:RsEm }) },
-        @{ L=('CO'+$script:RsSub2); V=$(if ($null -ne $d.Co2) { "$([int]$d.Co2)" } else { $script:RsEm }) },
-        @{ L='hPa';  V=$(if ($null -ne $d.Pres) { '{0:0}' -f $d.Pres } else { $script:RsEm }) })
-    $cw = ($p.Width-32)/4.0; $x = 16; $y = 46
-    foreach ($it in $items) {
-        Rs-Txt $g $it.L $script:RsFonts.Caption $T.TextT $x $y
-        Rs-Num $g $it.V $script:RsFonts.Body $T.TextP $x ($y+14) | Out-Null
-        $x += $cw
+function Toggle-Drawer {
+    if (-not ($script:dash -and $script:dash.Drawer)) { return }
+    $d = $script:dash.Drawer; $f = $script:dash.Form
+    if ($d.Visible) { $d.Visible = $false; return }
+    Sync-DrawerControls
+    $d.Bounds = New-Object System.Drawing.Rectangle(($f.ClientSize.Width - $d.Width), 0, $d.Width, $f.ClientSize.Height)
+    $d.Visible = $true; $d.BringToFront()
+}
+function Set-RoomName([string]$name) {
+    $name = $name.Trim(); if (-not $name) { $name = 'Room' }
+    if ($name.Length -gt 40) { $name = $name.Substring(0, 40) }
+    $script:settings.RoomName = $name
+    if ($script:dash) {
+        try { $script:dash.Verdict.Invalidate(); $script:dash.Form.Text = "Room state  -  $name" } catch {}
+        try { if ($script:dash.Ctl.Name.Text -ne $name -and -not $script:dash.Ctl.Name.Focused) { $script:dash.Ctl.Name.Text = $name } } catch {}
     }
-    if ($d.Spark) { Rs-Spark $g $d.Spark 16 ($p.Height-42) ($p.Width-32) 22 $T }
-    Rs-Txt $g 'click to open dashboard' $script:RsFonts.Caption $T.TextT 16 ($p.Height-16)
 }
-function Rs-AgeText([double]$min) { if ($min -lt 1) { 'just now' } elseif ($min -lt 90) { "$([int]$min)m ago" } else { '{0:0.0}h ago' -f ($min/60) } }
-function Refresh-Dashboard {
-    if (-not ($script:dash -and $script:dash.Form -and -not $script:dash.Form.IsDisposed)) { return }
-    $now = Get-Date
-    $r = $script:lastReading; $a = $script:lastAranet
-    $sensor = Get-SensorSeries; $aranet = Get-AranetSeries
-    $temp = if ($r) { [double]$r.TempC } else { $null }
-    $hum  = if ($r) { [double]$r.Humidity } else { $null }
-    $co2  = if ($a) { [double]$a.Co2 } else { $null }
-    $pres = if ($a) { [double]$a.Pres } else { $null }
-    $dew  = if ($null -ne $temp -and $null -ne $hum -and $hum -gt 0) { [Math]::Round((Get-Dewpoint $temp $hum),1) } else { $null }
-    $abs  = if ($null -ne $temp -and $null -ne $hum -and $hum -gt 0) { Rs-AbsHum $temp $hum } else { $null }
-    # freshness / stale detection (a reading older than ~3x its interval is stale)
-    $clockAge  = if ($r) { ($now - $r.When).TotalMinutes } else { $null }
-    $aranetAge = if ($a) { ($now - $a.When).TotalMinutes } else { $null }
-    $clockStaleMax  = [Math]::Max(3*(Clock-Interval), 20)
-    $aranetStaleMax = [Math]::Max(3*(Aranet-Interval), 12)
-    $clockStale  = ($null -ne $clockAge  -and $clockAge  -gt $clockStaleMax)
-    $aranetStale = ($null -ne $aranetAge -and $aranetAge -gt $aranetStaleMax)
-    $clockAgeTxt  = if ($null -ne $clockAge)  { Rs-AgeText $clockAge }  else { '' }
-    $aranetAgeTxt = if ($null -ne $aranetAge) { Rs-AgeText $aranetAge } else { '' }
-    $achR = Rs-ACH $a; $occ = Rs-Occupancy $a $achR.Ach; $achBand = Rs-AchBand $achR.Ach; $pt = Rs-Pressure $a; $vd = Rs-Verdict $co2 $temp $hum $occ
-    $tD = [Math]::Round((Rs-Delta $sensor 'TempC' $temp 1.0),1)
-    $hD = [Math]::Round((Rs-Delta $sensor 'Hum' $hum 1.0),0)
-    $cD = [Math]::Round((Rs-Delta $aranet 'Co2' $co2 1.0),0)
-    $pD = [Math]::Round((Rs-Delta $aranet 'Pres' $pres 1.0),1)
-    # verdict cross-fade + card settle on change
-    $reduced = Rs-ReducedMotion
-    $oldLine = if ($script:rs) { $script:rs.Verdict } else { '' }
-    if ($vd.Line -ne $oldLine) { $script:rsPrevVerdict = $oldLine; $script:rsVAlpha = if ($reduced) { 1.0 } else { 0.0 } }
-    $oldState = if ($script:rs) { $script:rs.State } else { 'good' }
-    if ($vd.State -ne $oldState -and -not $reduced) { $script:rsSettle['aq'] = 1.0 }
-    Rs-SetTargets @{ co2=$co2; v_temp=$temp; v_hum=$hum; v_co2=$co2; v_pres=$pres; dew=$dew; ach=$achR.Ach }
-    $script:rs = @{
-        Temp=$temp; Hum=$hum; Co2=$co2; Pres=$pres; Dew=$dew; Abs=$abs
-        Occ=$occ; Ach=$achR.Ach; ClearMin=$achR.ClearMin; AchBand=$achBand.Band; AchLevel=$achBand.Level
-        AchFresh=$achR.Fresh; AchChanged=$achR.Changed; AchAge=$achR.AgeMin; PresTrend=$pt.Trend; PresRate=$pt.Rate
-        Verdict=$vd.Line; State=$vd.State; Rebreathed=$(if ($null -ne $co2) { Rs-Rebreathed $co2 } else { $null })
-        Updated=$now; Timeline=$aranet
-        Co2Stale=$aranetStale; Co2Age=$aranetAgeTxt; AnyStale=($clockStale -or $aranetStale)
-        AranetWhen=$(if ($a) { $a.When } else { $null }); ClockWhen=$(if ($r) { $r.When } else { $null })
-        ClockBatt=$(if ($r -and $null -ne $r.Battery) { [int]$r.Battery } else { $null })
-        AranetBatt=$(if ($a -and $null -ne $a.Battery) { [int]$a.Battery } else { $null })
-        V=@{
-            temp=@{ Label='Temperature'; Raw=$temp; DispKey='v_temp'; Fmt='{0:0.0}'; Unit=($script:RsDeg+'C'); Icon='temp'; Spark=(Rs-Down (@(Rs-Recent $sensor 6.0 | ForEach-Object { $_.TempC })) 30); Delta=$tD; DUnit=$script:RsDeg; Stale=$clockStale; AgeText=$clockAgeTxt; DeltaHot=([Math]::Abs($tD) -ge 1.5) }
-            hum =@{ Label='Humidity'; Raw=$hum; DispKey='v_hum'; Fmt='{0:0}'; Unit='%'; Icon='drop'; Spark=(Rs-Down (@(Rs-Recent $sensor 6.0 | ForEach-Object { $_.Hum })) 30); Delta=$hD; DUnit='%'; Stale=$clockStale; AgeText=$clockAgeTxt; DeltaHot=([Math]::Abs($hD) -ge 8) }
-            co2 =@{ Label=('CO'+$script:RsSub2); Raw=$co2; DispKey='v_co2'; Fmt='{0:0}'; Unit='ppm'; Icon='air'; Spark=(Rs-Down (@(Rs-Recent $aranet 6.0 | ForEach-Object { [double]$_.Co2 })) 30); Delta=$cD; DUnit=''; Stale=$aranetStale; AgeText=$aranetAgeTxt; DeltaHot=([Math]::Abs($cD) -ge 200) }
-            pres=@{ Label='Pressure'; Raw=$pres; DispKey='v_pres'; Fmt='{0:0}'; Unit='hPa'; Icon='gauge'; Spark=(Rs-Down (@(Rs-Recent $aranet 6.0 | ForEach-Object { $_.Pres })) 30); Delta=$pD; DUnit=''; Stale=$aranetStale; AgeText=$aranetAgeTxt; DeltaHot=([Math]::Abs($pD) -ge 2.5) }
-        }
-    }
-    # announce the verdict to assistive tech (throttled to real changes)
-    if ($vd.Line -ne $oldLine -and $script:dash.Orb) { try { $script:dash.Orb.AccessibleName = $vd.Line; $script:dash.Orb.AccessibleDescription = $vd.Line } catch {} }
-    foreach ($pnl in $script:dash.Panels) { if ($pnl -and -not $pnl.IsDisposed) { $pnl.Invalidate() } }
-    if ($script:RsAnimTimer -and -not $reduced) { $script:RsAnimTimer.Start() }
-    Update-Dash-Controls
+function Begin-NameEdit {
+    $d = $script:dash; if (-not $d -or -not $d.NameRect) { return }
+    $b = $d.NameBox
+    $b.Text = [string]$script:settings.RoomName
+    $b.Location = New-Object System.Drawing.Point(($d.NameRect.X + 2), ($d.NameRect.Y + 1))
+    $b.Width = [Math]::Max(180, $d.NameRect.Width + 40)
+    $b.Visible = $true; $b.BringToFront(); [void]$b.Focus(); $b.SelectAll()
+    $d.Verdict.Invalidate()
 }
-
+function End-NameEdit([bool]$commit) {
+    $d = $script:dash; if (-not $d -or -not $d.NameBox.Visible) { return }
+    $d.NameBox.Visible = $false
+    if ($commit) { Set-RoomName $d.NameBox.Text; Save-Settings }
+    $d.Verdict.Invalidate()
+}
 function Toggle-Theme {
-    $new = if ($script:DashTheme.Mode -eq 'dark') { 'light' } else { 'dark' }
+    $new = 'dark'; if ($script:DashTheme.Mode -eq 'dark') { $new = 'light' }
     $script:settings.Theme = $new; Save-Settings
+    $reopen = [bool]($script:dash -and $script:dash.Drawer -and $script:dash.Drawer.Visible)
+    $bounds = $null; if ($script:dash -and $script:dash.Form) { $bounds = $script:dash.Form.Bounds }
     $f = $script:dash.Form; $script:dash = $null
     if ($f -and -not $f.IsDisposed) { $f.Close() }
+    if ($script:trendForm -and -not $script:trendForm.IsDisposed) { $script:trendForm.Close() }
     Show-Dashboard
+    if ($bounds -and $script:dash) { $script:dash.Form.Bounds = $bounds }
+    if ($reopen) { Toggle-Drawer }
 }
-# Create a Room State card panel wired to its painter scriptblock.
-function Rs-Card($painter) {
-    Ensure-DashTypes
+function Rs-Card($painter, [int]$right = 14) {
     $p = New-Object Vulcan.CardPanel
     $p.BackColor = $script:DashTheme.Canvas; $p.Dock = [System.Windows.Forms.DockStyle]::Fill
-    $p.Margin = New-Object System.Windows.Forms.Padding(0, 0, 16, 16); $p.Tag = @{}
+    $p.Margin = New-Object System.Windows.Forms.Padding(0, 0, $right, 14); $p.Tag = @{}
     $p.Add_Paint($painter)
     return $p
 }
-function New-RsTable([int]$cols) {
-    $t = New-BufferedTable; $t.Dock = [System.Windows.Forms.DockStyle]::Fill; $t.BackColor = $script:DashTheme.Canvas
+function New-RsTable([int]$cols, $percents) {
+    $t = New-Object Vulcan.BufferedTable; $t.Dock = [System.Windows.Forms.DockStyle]::Fill; $t.BackColor = $script:DashTheme.Canvas
+    $t.Margin = New-Object System.Windows.Forms.Padding(0)
     $t.ColumnCount = $cols; $t.RowCount = 1
+    foreach ($pc in $percents) { [void]$t.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, $pc))) }
+    [void]$t.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
     return $t
 }
 
@@ -1943,266 +1526,449 @@ function Show-Dashboard {
     try {
         if ($script:dash -and $script:dash.Form -and -not $script:dash.Form.IsDisposed) {
             $script:dash.Form.WindowState = [System.Windows.Forms.FormWindowState]::Normal
-            $script:dash.Form.Activate(); Refresh-Dashboard; return
+            $script:dash.Form.Activate(); Refresh-All; return
         }
-        $mode = if ($script:settings.Theme) { [string]$script:settings.Theme } else { 'dark' }
-        Apply-Theme $mode; Ensure-RsFonts; Ensure-DashTypes
+        $mode = 'dark'; if ($script:settings.Theme -eq 'light') { $mode = 'light' }
+        Apply-Theme $mode; Ensure-RsFonts
         $T = $script:DashTheme
-        $script:dash = @{ Gauges = @{}; ClockBtns = @(); AranetBtns = @(); Panels = @() }
+        $script:rsReduced = Rs-ReducedMotion
+        $script:dash = @{ Panels = @(); AnimPanels = @(); DrawerLabels = @(); Ctl = @{} }
+        $AS = [System.Windows.Forms.AnchorStyles]; $ST = [System.Windows.Forms.SizeType]
 
         $f = New-Object System.Windows.Forms.Form
-        $f.Text = 'Room state'
-        $f.BackColor = $T.Canvas
-        $f.Font = DashFont 9
+        $f.Text = "Room state  -  $($script:settings.RoomName)"
+        $f.BackColor = $T.Canvas; $f.Font = New-Object System.Drawing.Font('Segoe UI', 9); $f.KeyPreview = $true
         try { $f.Icon = [System.Drawing.Icon]::FromHandle($script:iconHandle) } catch {}
         $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-        $f.Size = New-Object System.Drawing.Size([Math]::Min(1280, $wa.Width - 60), [Math]::Min(960, $wa.Height - 50))
-        $f.MinimumSize = New-Object System.Drawing.Size(1040, 820)
+        $f.Size = New-Object System.Drawing.Size([Math]::Min(1180, $wa.Width - 60), [Math]::Min(880, $wa.Height - 40))
+        $f.MinimumSize = New-Object System.Drawing.Size(940, 820)
         $f.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+        $f.AccessibleName = 'Room state dashboard'
 
-        # Outer layout: verdict (flush) / body (fill) / controls (slim) / footer
-        $tl = New-Object System.Windows.Forms.TableLayoutPanel
+        # outer layout: verdict / alerts (only when there are any) / cards / action bar
+        $tl = New-Object Vulcan.BufferedTable
         $tl.Dock = [System.Windows.Forms.DockStyle]::Fill; $tl.BackColor = $T.Canvas
-        $tl.Padding = New-Object System.Windows.Forms.Padding(32, 22, 32, 10)
+        $tl.Padding = New-Object System.Windows.Forms.Padding(28, 20, 28, 8)
         $tl.ColumnCount = 1; $tl.RowCount = 4
-        [void]$tl.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 78)))
-        [void]$tl.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-        [void]$tl.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 150)))
-        [void]$tl.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 26)))
+        [void]$tl.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle($ST::Percent, 100)))
+        [void]$tl.RowStyles.Add((New-Object System.Windows.Forms.RowStyle($ST::Absolute, 84)))
+        [void]$tl.RowStyles.Add((New-Object System.Windows.Forms.RowStyle($ST::Absolute, 0)))
+        [void]$tl.RowStyles.Add((New-Object System.Windows.Forms.RowStyle($ST::Percent, 100)))
+        [void]$tl.RowStyles.Add((New-Object System.Windows.Forms.RowStyle($ST::Absolute, 58)))
+        $script:dash.Layout = $tl
 
-        # ---- Verdict (flush on canvas, no card) ----
+        # ---- verdict ----
         $verdict = New-Object Vulcan.CardPanel; $verdict.BackColor = $T.Canvas; $verdict.Dock = [System.Windows.Forms.DockStyle]::Fill
-        $verdict.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 6)
+        $verdict.Margin = New-Object System.Windows.Forms.Padding(0)
+        $verdict.AccessibleName = 'Room verdict'
         $verdict.Add_Paint({ param($s,$e); try { Rs-PaintVerdict $e.Graphics $this } catch { WLog "rs verdict: $($_.Exception.Message)" } })
-        $script:dash.Orb = $verdict
+        $orb = New-Object Vulcan.Orb; $orb.Location = New-Object System.Drawing.Point(0, 12); $orb.BackColor = $T.Canvas
+        $orb.Animate = (-not $script:rsReduced)
+        $nameBox = New-Object System.Windows.Forms.TextBox
+        $nameBox.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle; $nameBox.BackColor = $T.Sunken; $nameBox.ForeColor = $T.TextP
+        $nameBox.Font = $script:RsFonts.BodyB; $nameBox.MaxLength = 40; $nameBox.Visible = $false
+        $nameBox.AccessibleName = 'Room name'
+        $nameBox.Add_KeyDown({ param($s,$e)
+            if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Enter) { $e.SuppressKeyPress = $true; End-NameEdit $true }
+            elseif ($e.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { $e.SuppressKeyPress = $true; End-NameEdit $false } })
+        $nameBox.Add_Leave({ End-NameEdit $true })
+        $verdict.Controls.Add($orb); $verdict.Controls.Add($nameBox)
+        $verdict.Add_MouseMove({ param($s,$e); try { $over = ($script:dash.NameRect -and $script:dash.NameRect.Contains($e.Location)); $this.Cursor = if ($over) { [System.Windows.Forms.Cursors]::Hand } else { [System.Windows.Forms.Cursors]::Default } } catch {} })
+        $verdict.Add_MouseClick({ param($s,$e); try { if ($script:dash.NameRect -and $script:dash.NameRect.Contains($e.Location)) { Begin-NameEdit } } catch {} })
+        $script:dash.Verdict = $verdict; $script:dash.Orb = $orb; $script:dash.NameBox = $nameBox
 
-        # ---- Body ----
-        $body = New-BufferedTable; $body.Dock = [System.Windows.Forms.DockStyle]::Fill; $body.BackColor = $T.Canvas
+        # ---- alerts strip ----
+        $alertStrip = New-Object Vulcan.CardPanel; $alertStrip.BackColor = $T.Canvas; $alertStrip.Dock = [System.Windows.Forms.DockStyle]::Fill
+        $alertStrip.Margin = New-Object System.Windows.Forms.Padding(0); $alertStrip.AccessibleName = 'Alerts'
+        $alertStrip.Add_Paint({ param($s,$e); try { Rs-PaintAlerts $e.Graphics $this } catch { WLog "rs alerts: $($_.Exception.Message)" } })
+
+        # ---- cards ----
+        $body = New-Object Vulcan.BufferedTable; $body.Dock = [System.Windows.Forms.DockStyle]::Fill; $body.BackColor = $T.Canvas
+        $body.Margin = New-Object System.Windows.Forms.Padding(0)
         $body.ColumnCount = 1; $body.RowCount = 4
-        [void]$body.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-        [void]$body.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 186)))
-        [void]$body.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 126)))
-        [void]$body.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 172)))
-        [void]$body.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+        [void]$body.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle($ST::Percent, 100)))
+        [void]$body.RowStyles.Add((New-Object System.Windows.Forms.RowStyle($ST::Absolute, 180)))
+        [void]$body.RowStyles.Add((New-Object System.Windows.Forms.RowStyle($ST::Absolute, 118)))
+        [void]$body.RowStyles.Add((New-Object System.Windows.Forms.RowStyle($ST::Absolute, 162)))
+        [void]$body.RowStyles.Add((New-Object System.Windows.Forms.RowStyle($ST::Percent, 100)))
 
-        # row 1: air quality (span 2) + occupancy
-        $r1 = New-RsTable 3
-        [void]$r1.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 40)))
-        [void]$r1.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 27)))
-        [void]$r1.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 33)))
+        $r1 = New-RsTable 2 @(62, 38)
         $aq  = Rs-Card { param($s,$e); try { Rs-PaintAirQuality $e.Graphics $this } catch { WLog "rs aq: $($_.Exception.Message)" } }
-        $occ = Rs-Card { param($s,$e); try { Rs-PaintOccupancy $e.Graphics $this } catch { WLog "rs occ: $($_.Exception.Message)" } }
-        $occ.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 16)
-        $r1.Controls.Add($aq, 0, 0); $r1.SetColumnSpan($aq, 2); $r1.Controls.Add($occ, 2, 0)
+        $occ = Rs-Card { param($s,$e); try { Rs-PaintOccupancy $e.Graphics $this } catch { WLog "rs occ: $($_.Exception.Message)" } } 0
+        $r1.Controls.Add($aq, 0, 0); $r1.Controls.Add($occ, 1, 0)
 
-        # row 2: vitals 4-up
-        $r2 = New-RsTable 4
-        1..4 | ForEach-Object { [void]$r2.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 25))) }
-        $vCards = @{}
-        $vi = 0
+        $r2 = New-RsTable 4 @(25, 25, 25, 25)
+        $vCards = @{}; $vi = 0
         foreach ($key in @('temp','hum','co2','pres')) {
-            $c = Rs-Card { param($s,$e); try { Rs-PaintVital $e.Graphics $this } catch { WLog "rs vital: $($_.Exception.Message)" } }
+            $right = 14; if ($vi -eq 3) { $right = 0 }
+            $c = Rs-Card { param($s,$e); try { Rs-PaintVital $e.Graphics $this } catch { WLog "rs vital: $($_.Exception.Message)" } } $right
             $c.Tag = @{ Key = $key }
-            if ($vi -eq 3) { $c.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 16) }
             $r2.Controls.Add($c, $vi, 0); $vCards[$key] = $c; $vi++
         }
 
-        # row 3: ventilation / comfort / outside
-        $r3 = New-RsTable 3
-        1..3 | ForEach-Object { [void]$r3.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 33.33))) }
+        $r3 = New-RsTable 3 @(36, 32, 32)
         $vent = Rs-Card { param($s,$e); try { Rs-PaintVentilation $e.Graphics $this } catch { WLog "rs vent: $($_.Exception.Message)" } }
         $comf = Rs-Card { param($s,$e); try { Rs-PaintComfort $e.Graphics $this } catch { WLog "rs comf: $($_.Exception.Message)" } }
-        $outs = Rs-Card { param($s,$e); try { Rs-PaintOutside $e.Graphics $this } catch { WLog "rs out: $($_.Exception.Message)" } }
-        $outs.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 16)
+        $outs = Rs-Card { param($s,$e); try { Rs-PaintOutside $e.Graphics $this } catch { WLog "rs out: $($_.Exception.Message)" } } 0
         $r3.Controls.Add($vent, 0, 0); $r3.Controls.Add($comf, 1, 0); $r3.Controls.Add($outs, 2, 0)
 
-        # row 4: timeline
-        $timeline = Rs-Card { param($s,$e); try { Rs-PaintTimeline $e.Graphics $this } catch { WLog "rs timeline: $($_.Exception.Message)" } }
-        $timeline.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 0)
-
+        $timeline = Rs-Card { param($s,$e); try { Rs-PaintTimeline $e.Graphics $this } catch { WLog "rs timeline: $($_.Exception.Message)" } } 0
+        $timeline.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 6)
+        $timeline.Cursor = [System.Windows.Forms.Cursors]::Hand
+        $timeline.Add_MouseMove({ param($s,$e); try { $w = $this.Width-40; if ($w -gt 0) { $fr = ($e.X-20)/[double]$w; if ($fr -lt 0) { $fr = 0 }; if ($fr -gt 1) { $fr = 1 }; $script:rsScrubFrac = $fr; $this.Invalidate() } } catch {} })
+        $timeline.Add_MouseLeave({ param($s,$e); $script:rsScrubFrac = $null; try { $this.Invalidate() } catch {} })
+        $timeline.Add_Click({ try { Show-TrendsWindow } catch {} })
         $body.Controls.Add($r1, 0, 0); $body.Controls.Add($r2, 0, 1); $body.Controls.Add($r3, 0, 2); $body.Controls.Add($timeline, 0, 3)
 
-        # ---- Controls (slim strip, restyled to tokens) ----
-        $ctl = New-Object System.Windows.Forms.Panel; $ctl.Dock = [System.Windows.Forms.DockStyle]::Fill; $ctl.BackColor = $T.Canvas
-        $sep = New-Object System.Windows.Forms.Panel; $sep.BackColor = $T.Hairline; $sep.Height = 1; $sep.Dock = [System.Windows.Forms.DockStyle]::Top
-        $ctl.Controls.Add($sep)
-        $script:dash.ConnTog = New-DashSwitch 4 16
-        $script:dash.ConnTog.Add_Paint({ param($s,$e); try { Draw-Toggle $e.Graphics $this ([bool]$script:settings.ConnectionEnabled) } catch { WLog "paint tog: $($_.Exception.Message)" } })
-        $script:dash.ConnTog.Add_Click({ Toggle-Connection })
-        $script:dash.AranetTog = New-DashSwitch 196 16
-        $script:dash.AranetTog.Add_Paint({ param($s,$e); try { Draw-Toggle $e.Graphics $this ([bool]$script:settings.AranetEnabled) } catch { WLog "paint tog: $($_.Exception.Message)" } })
-        $script:dash.AranetTog.Add_Click({ Toggle-Aranet })
-        $script:dash.LogTog = New-DashSwitch 388 16
-        $script:dash.LogTog.Add_Paint({ param($s,$e); try { Draw-Toggle $e.Graphics $this ([bool]$script:settings.HourlyLogging) } catch { WLog "paint tog: $($_.Exception.Message)" } })
-        $script:dash.LogTog.Add_Click({ $script:settings.HourlyLogging = -not $script:settings.HourlyLogging; Save-Settings; $script:dash.LogTog.Invalidate(); Refresh-Menu })
-        $script:dash.StartupTog = New-DashSwitch 560 16
-        $script:dash.StartupTog.Add_Paint({ param($s,$e); try { Draw-Toggle $e.Graphics $this ([bool](Test-Startup)) } catch { WLog "paint tog: $($_.Exception.Message)" } })
-        $script:dash.StartupTog.Add_Click({ Set-Startup (-not (Test-Startup)); $script:dash.StartupTog.Invalidate(); Refresh-Menu })
-        $script:dash.ThemeTog = New-DashSwitch 736 16
-        $script:dash.ThemeTog.Add_Paint({ param($s,$e); try { Draw-Toggle $e.Graphics $this ($script:DashTheme.Mode -eq 'light') } catch { WLog "paint tog: $($_.Exception.Message)" } })
-        $script:dash.ThemeTog.Add_Click({ Toggle-Theme })
-        $ctl.Controls.AddRange(@(
-            $script:dash.ConnTog,   (New-Lbl 'Connection'     (DashFont 9.5) $T.TextS $T.Canvas 58 19),
-            $script:dash.AranetTog, (New-Lbl 'Aranet CO2'     (DashFont 9.5) $T.TextS $T.Canvas 250 19),
-            $script:dash.LogTog,    (New-Lbl 'Log to CSV'     (DashFont 9.5) $T.TextS $T.Canvas 442 19),
-            $script:dash.StartupTog,(New-Lbl 'Start at login' (DashFont 9.5) $T.TextS $T.Canvas 614 19),
-            $script:dash.ThemeTog,  (New-Lbl 'Light theme'    (DashFont 9.5) $T.TextS $T.Canvas 790 19)
-        ))
-        $script:dash.ClockBtns = New-DashSeg $ctl 'Clock read (min)' 4 @(5,10,15,30,60) $T.Accent ([int]$script:settings.IntervalMinutes) `
-            ({ param($s,$e); $script:settings.IntervalMinutes = [int]$s.Tag; $script:clockDue = Get-Date; Save-Settings; Update-Dash-Controls; Refresh-Menu })
-        $script:dash.AranetBtns = New-DashSeg $ctl 'Aranet read (min)' 412 @(1,2,3,5,10,15,30) $T.Accent ([int]$script:settings.AranetIntervalMinutes) `
-            ({ param($s,$e); $script:settings.AranetIntervalMinutes = [int]$s.Tag; $script:aranetDue = Get-Date; Save-Settings; Update-Dash-Controls; Refresh-Menu })
-        $bSync = New-DashButton 'Sync clock' $T.Accent; $bSync.Location = New-Object System.Drawing.Point(4, 104); $bSync.Add_Click({ Start-Bg -Kind 'sync' -LogCsv $false -Notify $true })
-        $bReadC = New-DashButton 'Read clock' $T.Sunken $T.TextP; $bReadC.Location = New-Object System.Drawing.Point(162, 104); $bReadC.Add_Click({ Start-Bg -Kind 'read' -LogCsv $true -Notify $true })
-        $bReadA = New-DashButton 'Read Aranet4' $T.Sunken $T.TextP; $bReadA.Location = New-Object System.Drawing.Point(320, 104); $bReadA.Add_Click({ Force-Aranet })
-        $bData = New-DashButton 'Open data folder' $T.Sunken $T.TextP; $bData.Location = New-Object System.Drawing.Point(478, 104); $bData.Add_Click({ Start-Process explorer.exe $LogDir })
-        $ctl.Controls.AddRange(@($bSync, $bReadC, $bReadA, $bData))
-        # room volume (m3) - feeds the occupancy mass-balance estimate
-        $lblVol = New-Lbl ('Room volume (m'+$script:RsSup3+')') (DashFont 9.5) $T.TextS $T.Canvas 648 114
-        $numVol = New-Object System.Windows.Forms.NumericUpDown
-        $numVol.Minimum = 5; $numVol.Maximum = 1000; $numVol.Increment = 1; $numVol.Font = DashFont 10
-        $numVol.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
-        $numVol.BackColor = $T.Sunken; $numVol.ForeColor = $T.TextP
-        $numVol.Location = New-Object System.Drawing.Point(772, 110); $numVol.Width = 66
-        $numVol.Value = [decimal][Math]::Min(1000, [Math]::Max(5, [int]$script:settings.RoomVolume))
-        $numVol.Add_ValueChanged({ $script:settings.RoomVolume = [int]$this.Value; Save-Settings; if ($script:dash) { Refresh-Dashboard } })
-        $ctl.Controls.AddRange(@($lblVol, $numVol))
+        # ---- action bar: the few things you do, then status / messages on the right ----
+        $bar = New-Object System.Windows.Forms.Panel; $bar.Dock = [System.Windows.Forms.DockStyle]::Fill; $bar.BackColor = $T.Canvas
+        $bar.Margin = New-Object System.Windows.Forms.Padding(0)
+        $status = New-Object Vulcan.CardPanel; $status.BackColor = $T.Canvas; $status.Dock = [System.Windows.Forms.DockStyle]::Fill
+        $status.AccessibleName = 'Status'
+        $status.Add_Paint({ param($s,$e); try { Rs-PaintStatus $e.Graphics $this } catch { WLog "rs status: $($_.Exception.Message)" } })
+        $flow = New-Object System.Windows.Forms.FlowLayoutPanel
+        $flow.Dock = [System.Windows.Forms.DockStyle]::Left; $flow.AutoSize = $true; $flow.WrapContents = $false; $flow.BackColor = $T.Canvas
+        $flow.Padding = New-Object System.Windows.Forms.Padding(0, 9, 12, 0); $flow.Margin = New-Object System.Windows.Forms.Padding(0)
+        $mk = { param($text, $glyph, [bool]$primary, $name)
+            $b = New-Object Vulcan.PillButton; $b.Text = $text; $b.Glyph = $glyph; $b.Primary = $primary; $b.BackColor = $script:DashTheme.Canvas
+            $b.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 0); $b.AccessibleName = $name; [void]$b.Fit(); $b }
+        $bRead = & $mk 'Read now' $script:GlRefresh $true 'Read both devices now'
+        $bSync = & $mk 'Sync clock time' $script:GlSync $false 'Set the clock time'
+        $bTrend = & $mk 'Trends' $script:GlChart $false 'Open the trends graphs'
+        $bSet = & $mk 'Settings' $script:GlGear $false 'Open settings'
+        $bRead.Add_Click({ Read-Now })
+        $bSync.Add_Click({ Start-Bg -Kind 'sync' -LogCsv $false -Notify $true })
+        $bTrend.Add_Click({ Show-TrendsWindow })
+        $bSet.Add_Click({ Toggle-Drawer })
+        $flow.Controls.AddRange(@($bRead, $bSync, $bTrend, $bSet))
+        $bar.Controls.Add($status)   # Fill first
+        $bar.Controls.Add($flow)     # Left last
+        $script:dash.Status = $status
 
-        # ---- Footer ----
-        $footer = New-Object Vulcan.CardPanel; $footer.BackColor = $T.Canvas; $footer.Dock = [System.Windows.Forms.DockStyle]::Fill
-        $footer.Add_Paint({ param($s,$e); try { Rs-PaintFooter $e.Graphics $this } catch { WLog "rs footer: $($_.Exception.Message)" } })
-
-        $tl.Controls.Add($verdict, 0, 0); $tl.Controls.Add($body, 0, 1); $tl.Controls.Add($ctl, 0, 2); $tl.Controls.Add($footer, 0, 3)
+        $tl.Controls.Add($verdict, 0, 0); $tl.Controls.Add($alertStrip, 0, 1); $tl.Controls.Add($body, 0, 2); $tl.Controls.Add($bar, 0, 3)
         $f.Controls.Add($tl)
 
-        # in-window toast for read feedback (floats above the cards, auto-hides)
-        $toast = New-Object Vulcan.CardPanel; $toast.BackColor = $T.Canvas; $toast.Visible = $false; $toast.Tag = $null
-        $toast.Add_Paint({ param($s,$e); try { Rs-PaintToast $e.Graphics $this } catch { WLog "toast: $($_.Exception.Message)" } })
-        $f.Controls.Add($toast); $toast.BringToFront()
-        $script:dash.Toast = $toast
-        $script:dash.ToastTimer = New-Object System.Windows.Forms.Timer; $script:dash.ToastTimer.Interval = 5500
-        $script:dash.ToastTimer.Add_Tick({ try { $script:dash.ToastTimer.Stop(); if ($script:dash -and $script:dash.Toast -and -not $script:dash.Toast.IsDisposed) { $script:dash.Toast.Visible = $false } } catch {} })
+        # ---- settings drawer (slides over the right edge) ----
+        $dw = 348
+        $drawer = New-Object Vulcan.CardPanel; $drawer.BackColor = $T.Surface; $drawer.Visible = $false
+        $drawer.Size = New-Object System.Drawing.Size($dw, $f.ClientSize.Height)
+        $drawer.Anchor = ($AS::Top -bor $AS::Bottom -bor $AS::Right)
+        $drawer.AccessibleName = 'Settings'
+        $drawer.Add_Paint({ param($s,$e); try { Rs-PaintDrawer $e.Graphics $this } catch { WLog "rs drawer: $($_.Exception.Message)" } })
+        $labels = New-Object System.Collections.ArrayList
+        $ctl = $script:dash.Ctl
+        $tgl = { param($text, [int]$y, $key, $name)
+            [void]$labels.Add(@{ Kind = 'row'; Text = $text; Y = $y })
+            $t = New-Object Vulcan.Toggle; $t.BackColor = $script:DashTheme.Surface; $t.Location = New-Object System.Drawing.Point(($dw - 24 - 44), ($y - 3)); $t.AccessibleName = $name
+            $drawer.Controls.Add($t); $ctl[$key] = $t; $t }
+        $closeB = New-Object Vulcan.PillButton; $closeB.Glyph = $script:GlClose; $closeB.Text = ''; $closeB.Quiet = $true; $closeB.BackColor = $T.Surface
+        $closeB.Size = New-Object System.Drawing.Size(34, 34); $closeB.Location = New-Object System.Drawing.Point(($dw - 24 - 34), 14); $closeB.AccessibleName = 'Close settings'
+        $closeB.Add_Click({ Toggle-Drawer }); $drawer.Controls.Add($closeB)
 
-        $script:dash.Panels = @($verdict, $aq, $occ, $vCards['temp'], $vCards['hum'], $vCards['co2'], $vCards['pres'], $vent, $comf, $outs, $timeline, $footer)
-        $script:dash.AnimPanels = @($aq, $vCards['temp'], $vCards['hum'], $vCards['co2'], $vCards['pres'], $vent, $comf)
+        $y = 66
+        [void]$labels.Add(@{ Kind = 'section'; Text = 'ROOM'; Y = $y }); $y += 24
+        [void]$labels.Add(@{ Kind = 'row'; Text = 'Name'; Y = $y })
+        $tbName = New-Object System.Windows.Forms.TextBox
+        $tbName.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle; $tbName.BackColor = $T.Sunken; $tbName.ForeColor = $T.TextP
+        $tbName.Font = $script:RsFonts.Body; $tbName.MaxLength = 40; $tbName.Text = [string]$script:settings.RoomName
+        $tbName.Location = New-Object System.Drawing.Point(124, ($y - 3)); $tbName.Width = $dw - 124 - 24; $tbName.AccessibleName = 'Room name'
+        $tbName.Add_TextChanged({ if ($this.Focused) { Set-RoomName $this.Text } })
+        $tbName.Add_Leave({ Set-RoomName $this.Text; $this.Text = [string]$script:settings.RoomName; Save-Settings })
+        $tbName.Add_KeyDown({ param($s,$e); if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Enter) { $e.SuppressKeyPress = $true; Save-Settings } })
+        $drawer.Controls.Add($tbName); $ctl.Name = $tbName; $y += 36
+        [void]$labels.Add(@{ Kind = 'row'; Text = ('Volume, m' + $script:RsSup3); Y = $y })
+        $numVol = New-Object System.Windows.Forms.NumericUpDown
+        $numVol.Minimum = 5; $numVol.Maximum = 2000; $numVol.Increment = 1; $numVol.Font = $script:RsFonts.Body
+        $numVol.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle; $numVol.BackColor = $T.Sunken; $numVol.ForeColor = $T.TextP
+        $numVol.Location = New-Object System.Drawing.Point(($dw - 24 - 84), ($y - 3)); $numVol.Width = 84; $numVol.AccessibleName = 'Room volume in cubic metres'
+        $numVol.Value = [decimal][Math]::Min(2000, [Math]::Max(5, [int]$script:settings.RoomVolume))
+        $numVol.Add_ValueChanged({ $script:settings.RoomVolume = [int]$this.Value; Save-Settings; Refresh-All })
+        $drawer.Controls.Add($numVol); $ctl.Vol = $numVol; $y += 28
+        [void]$labels.Add(@{ Kind = 'note'; Text = 'Length x width x height. Used to turn CO2 into a headcount.'; Y = $y }); $y += 44
+
+        [void]$labels.Add(@{ Kind = 'section'; Text = 'DEVICES'; Y = $y }); $y += 24
+        $tg = & $tgl 'Bluetooth connection' $y 'Conn' 'Bluetooth connection'; $tg.Add_CheckedChanged({ if ([bool]$this.Checked -ne [bool]$script:settings.ConnectionEnabled) { Toggle-Connection } }); $y += 34
+        $tg = & $tgl ('Aranet4 CO' + $script:RsSub2 + ' monitor') $y 'Aranet' 'Aranet4 monitor'; $tg.Add_CheckedChanged({ if ([bool]$this.Checked -ne [bool]$script:settings.AranetEnabled) { Toggle-Aranet } }); $y += 34
+        $tg = & $tgl 'Log readings to CSV' $y 'Log' 'Log readings to CSV'; $tg.Add_CheckedChanged({ $script:settings.HourlyLogging = [bool]$this.Checked; Save-Settings; Refresh-Menu }); $y += 36
+        [void]$labels.Add(@{ Kind = 'row'; Text = 'Read the clock every (minutes)'; Y = $y }); $y += 26
+        $seg = New-Object Vulcan.Segmented; $seg.BackColor = $T.Surface
+        $seg.Items = [string[]]@($script:ClockIvlOptions | ForEach-Object { "$_" })
+        $seg.Location = New-Object System.Drawing.Point(24, $y); $seg.Width = $dw - 48; $seg.AccessibleName = 'Clock read interval'
+        $seg.Add_SelectedChanged({ $i = $this.SelectedIndex; if ($i -ge 0) { Set-ClockInterval ([int]$script:ClockIvlOptions[$i]) } })
+        $drawer.Controls.Add($seg); $ctl.Seg = $seg; $y += 36
+        [void]$labels.Add(@{ Kind = 'note'; Text = 'Each read wakes the clock over Bluetooth, so shorter intervals use more of its battery.'; Y = $y }); $y += 46
+
+        [void]$labels.Add(@{ Kind = 'section'; Text = 'ALERTS'; Y = $y }); $y += 24
+        $tg = & $tgl 'Notify me when something needs attention' $y 'Alerts' 'Notifications'; $tg.Add_CheckedChanged({ $script:settings.AlertsEnabled = [bool]$this.Checked; Save-Settings; Refresh-Menu }); $y += 34
+        $tg = & $tgl 'Stay quiet at night (22:00 to 07:00)' $y 'Quiet' 'Quiet at night'; $tg.Add_CheckedChanged({ $script:settings.QuietNight = [bool]$this.Checked; Save-Settings }); $y += 46
+
+        [void]$labels.Add(@{ Kind = 'section'; Text = 'APP'; Y = $y }); $y += 24
+        $tg = & $tgl 'Light theme' $y 'Theme' 'Light theme'; $tg.Add_CheckedChanged({ if ([bool]$this.Checked -ne ($script:DashTheme.Mode -eq 'light')) { [void]$script:dash.Form.BeginInvoke([System.Action]{ Toggle-Theme }) } }); $y += 34
+        $tg = & $tgl 'Start when I sign in' $y 'Startup' 'Start at sign-in'; $tg.Add_CheckedChanged({ Set-Startup ([bool]$this.Checked); Refresh-Menu }); $y += 44
+        $bData = New-Object Vulcan.PillButton; $bData.Text = 'Open data folder'; $bData.Glyph = $script:GlFolder; $bData.BackColor = $T.Surface; [void]$bData.Fit()
+        $bData.Location = New-Object System.Drawing.Point(24, $y); $bData.Add_Click({ Start-Process explorer.exe $LogDir })
+        $drawer.Controls.Add($bData)
+        $script:dash.DrawerLabels = @($labels); $script:dash.Drawer = $drawer
+        $f.Controls.Add($drawer); $drawer.BringToFront()
+
+        $script:dash.Panels = @($verdict, $alertStrip, $aq, $occ, $vCards['temp'], $vCards['hum'], $vCards['co2'], $vCards['pres'], $vent, $comf, $outs, $timeline, $status)
+        $script:dash.AnimPanels = @($aq, $vCards['temp'], $vCards['hum'], $vCards['co2'], $vCards['pres'], $comf)
         $script:dash.Form = $f
-
-        # accessibility: names for assistive tech (colour is never the only signal -
-        # every state also carries a label, a position, or an icon).
-        $f.AccessibleName = 'Room state dashboard'
-        $verdict.AccessibleName = 'Room verdict'
         $aq.AccessibleName = 'Air quality'; $occ.AccessibleName = 'Occupancy'
         $vCards['temp'].AccessibleName = 'Temperature'; $vCards['hum'].AccessibleName = 'Humidity'
         $vCards['co2'].AccessibleName = 'CO2'; $vCards['pres'].AccessibleName = 'Pressure'
         $vent.AccessibleName = 'Ventilation'; $comf.AccessibleName = 'Comfort'; $outs.AccessibleName = 'Outside'; $timeline.AccessibleName = 'Today timeline'
 
-        # timeline: scrub to read any moment; click opens the full zoomable trends graph
-        $timeline.Cursor = [System.Windows.Forms.Cursors]::Hand
-        $timeline.Add_MouseMove({ param($s,$e); try { $w = $this.Width-40; if ($w -gt 0) { $fr = ($e.X-20)/[double]$w; if ($fr -lt 0) { $fr = 0 }; if ($fr -gt 1) { $fr = 1 }; $script:rsScrubFrac = $fr; $this.Invalidate() } } catch {} })
-        $timeline.Add_MouseLeave({ param($s,$e); $script:rsScrubFrac = $null; try { $this.Invalidate() } catch {} })
-        $timeline.Add_Click({ try { Show-TrendsWindow } catch {} })
+        $f.Add_KeyDown({ param($s,$e)
+            try {
+                if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Escape -and $script:dash.Drawer.Visible -and -not $script:dash.NameBox.Visible) { Toggle-Drawer; $e.Handled = $true }
+                elseif ($e.KeyCode -eq [System.Windows.Forms.Keys]::F5) { Read-Now; $e.Handled = $true }
+            } catch {} })
 
-        # unified animation loop: breathing orb + value tweens + verdict cross-fade
-        # + state-change settle. Skipped entirely when the OS prefers reduced motion.
-        $script:OrbPhase = 1.0; $script:OrbT = 0.0; $script:rsScrubFrac = $null
+        # Tweens run only while something is actually moving, then the timer stops.
         if ($script:RsAnimTimer) { try { $script:RsAnimTimer.Stop(); $script:RsAnimTimer.Dispose() } catch {} }
-        $script:RsAnimTimer = $null
-        if (-not (Rs-ReducedMotion)) {
-            $script:OrbPhase = 0.0
-            $script:RsAnimTimer = New-Object System.Windows.Forms.Timer; $script:RsAnimTimer.Interval = 40
-            $script:RsAnimTimer.Add_Tick({
-                if (-not ($script:dash -and $script:dash.Form -and -not $script:dash.Form.IsDisposed)) { return }
-                $script:OrbT += 0.04
-                $script:OrbPhase = (1 - [Math]::Cos($script:OrbT / 2.4 * 2 * [Math]::PI)) / 2
+        $script:RsAnimTimer = New-Object System.Windows.Forms.Timer; $script:RsAnimTimer.Interval = 33
+        $script:RsAnimTimer.Add_Tick({
+            try {
+                if (-not ($script:dash -and $script:dash.Form -and -not $script:dash.Form.IsDisposed)) { $script:RsAnimTimer.Stop(); return }
                 $moving = Rs-AnimStep
                 $fading = $false
-                if ($script:rsVAlpha -lt 1) { $script:rsVAlpha = [Math]::Min(1.0, $script:rsVAlpha + 0.10); $fading = $true }
+                if ($script:rsVAlpha -lt 1) { $script:rsVAlpha = [Math]::Min(1.0, $script:rsVAlpha + 0.12); $fading = $true }
                 $settling = $false
-                foreach ($k in @($script:rsSettle.Keys)) { $v = $script:rsSettle[$k]*0.88; if ($v -lt 0.02) { [void]$script:rsSettle.Remove($k) } else { $script:rsSettle[$k] = $v; $settling = $true } }
-                if ($script:dash.Orb -and -not $script:dash.Orb.IsDisposed) {
-                    if ($fading) { $script:dash.Orb.Invalidate() } else { $script:dash.Orb.Invalidate((New-Object System.Drawing.Rectangle(0,0,40,40))) }
-                }
+                foreach ($k in @($script:rsSettle.Keys)) { $v = $script:rsSettle[$k]*0.86; if ($v -lt 0.02) { [void]$script:rsSettle.Remove($k) } else { $script:rsSettle[$k] = $v; $settling = $true } }
+                if ($fading) { $script:dash.Verdict.Invalidate() }
                 if ($moving -or $settling) { foreach ($pnl in $script:dash.AnimPanels) { if ($pnl -and -not $pnl.IsDisposed) { $pnl.Invalidate() } } }
-            })
-            $script:RsAnimTimer.Start()
-        }
-        $f.Add_FormClosed({ $script:dash = $null; $script:rsScrubFrac = $null; try { if ($script:RsAnimTimer) { $script:RsAnimTimer.Stop(); $script:RsAnimTimer.Dispose(); $script:RsAnimTimer = $null } } catch {} })
-
-        Refresh-Dashboard
+                if (-not ($moving -or $fading -or $settling)) { $script:RsAnimTimer.Stop() }
+            } catch { $script:RsAnimTimer.Stop() }
+        })
+        $f.Add_FormClosed({
+            $script:dash = $null; $script:rsScrubFrac = $null; $script:toast = $null
+            try { if ($script:RsAnimTimer) { $script:RsAnimTimer.Stop(); $script:RsAnimTimer.Dispose(); $script:RsAnimTimer = $null } } catch {}
+        })
+        $script:rsVAlpha = 1.0
+        Sync-DrawerControls
+        Refresh-All
         $f.Show(); $f.Activate()
     } catch { WLog "ERROR dashboard: $($_.Exception.Message) :: $($_.ScriptStackTrace)" }
 }
 
-# Connection / Aranet toggles shared by the tray menu and the dashboard.
-function Toggle-Connection {
-    $script:settings.ConnectionEnabled = -not $script:settings.ConnectionEnabled
-    Save-Settings
-    if ($script:settings.ConnectionEnabled) {
-        $script:clockDue = Get-Date; $script:aranetDue = (Get-Date).AddSeconds(20)
-        Update-Icon $script:lastText $false; Ensure-AranetWatcher; Scheduler-Tick
-    } else {
-        Stop-AranetWatcher; Update-Icon $script:lastText $true
-        $script:ni.Text = 'LYWSD02  -  connection off (battery saver)'
-    }
-    Refresh-Menu; if ($script:dash) { $script:dash.ConnTog.Invalidate(); Refresh-Dashboard }
-}
-function Toggle-Aranet {
-    $script:settings.AranetEnabled = -not $script:settings.AranetEnabled
-    Save-Settings; Refresh-Menu
-    if ($script:settings.AranetEnabled) { if ($script:settings.ConnectionEnabled) { Ensure-AranetWatcher; $script:aranetDue = (Get-Date).AddSeconds(20) } }
-    else { Stop-AranetWatcher }
-    if ($script:dash) { $script:dash.AranetTog.Invalidate() }
-}
+# ===========================================================================
+#  Main
+# ===========================================================================
+$script:settings = Load-Settings
+if ($SelfTestTheme) { $script:settings.Theme = $SelfTestTheme }
 
-# ---- Menu handlers --------------------------------------------------------
-$miRead.Add_Click({ Start-Bg -Kind 'read' -LogCsv $true -Notify $true })
-$miReadAranet.Add_Click({ Force-Aranet })
-$miSync.Add_Click({ Start-Bg -Kind 'sync' -LogCsv $false -Notify $true })
-$miTrends.Add_Click({ Show-Dashboard })
-$miConn.Add_Click({ Toggle-Connection })
-$miLog.Add_Click({ $script:settings.HourlyLogging = -not $script:settings.HourlyLogging; Save-Settings; Refresh-Menu; if ($script:dash) { $script:dash.LogTog.Invalidate() } })
-$miAranet.Add_Click({ Toggle-Aranet })
-$miOpen.Add_Click({ Start-Process explorer.exe $LogDir })
-$miStartup.Add_Click({ Set-Startup (-not (Test-Startup)); Refresh-Menu })
-$miExit.Add_Click({
-    try { Stop-AranetWatcher } catch {}
-    try { $script:ni.Visible = $false } catch {}
-    try { if ($script:iconHandle -ne [IntPtr]::Zero) { [void][LywsdNative.U32]::DestroyIcon($script:iconHandle) } } catch {}
-    try { $script:ni.Dispose() } catch {}
-    [System.Windows.Forms.Application]::Exit()
+if (-not $SelfTest) { Trim-Logs }
+$rowsLoaded = [Vulcan.Data]::Load($CsvPath, $AranetCsv)
+if ([Vulcan.Data]::LastError) { WLog "WARN history: $([Vulcan.Data]::LastError)" }
+Apply-Theme $(if ($script:settings.Theme -eq 'light') { 'light' } else { 'dark' })
+Ensure-RsFonts
+$script:startedAt = Get-Date
+$script:clockDue = Get-Date; $script:nextStateAt = Get-Date; $script:nextTrimAt = (Get-Date).AddHours(24)
+$script:toast = $null; $script:aranetForce = $null; $script:dash = $null
+$script:sessionLocked = $false; $script:unlockedAt = [datetime]::MinValue
+$script:pauseEvt = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::ManualReset, 'LYWSD02_Aranet_Pause')
+
+# ---- tray icon + menu ----
+$script:ni = New-Object System.Windows.Forms.NotifyIcon
+$script:ni.Text = 'Room state'
+$menu = New-Object System.Windows.Forms.ContextMenuStrip
+function New-MenuItem([string]$text) { New-Object System.Windows.Forms.ToolStripMenuItem($text) }
+$miTitle   = New-MenuItem 'Room state'; $miTitle.Enabled = $false; $mf = $miTitle.Font; $miTitle.Font = New-Object System.Drawing.Font($mf.FontFamily, $mf.Size, [System.Drawing.FontStyle]::Bold)
+$miReading = New-MenuItem 'No reading yet'; $miReading.Enabled = $false
+$miDash    = New-MenuItem 'Open dashboard'
+$miTrends  = New-MenuItem 'Trends...'
+$miRead    = New-MenuItem 'Read now'
+$miSync    = New-MenuItem 'Sync clock time'
+$miConn    = New-MenuItem 'Bluetooth connection'
+$miAranet  = New-MenuItem 'Aranet4 CO2 monitor'
+$miLog     = New-MenuItem 'Log readings to CSV'
+$miAlerts  = New-MenuItem 'Notifications'
+$miClockIvl = New-MenuItem 'Clock read interval'
+$miOpen    = New-MenuItem 'Open data folder'
+$miStartup = New-MenuItem 'Start when I sign in'
+$miExit    = New-MenuItem 'Exit'
+# The clock connects over Bluetooth for each read, which costs its battery.
+$script:ClockIvlOptions = @(5, 10, 15, 30, 60)
+$script:miClockIvlItems = @{}
+foreach ($mins in $script:ClockIvlOptions) {
+    $item = New-Object System.Windows.Forms.ToolStripMenuItem("Every $mins minutes")
+    $item.Tag = $mins
+    $item.Add_Click({ param($s,$e) Set-ClockInterval ([int]$s.Tag) })
+    [void]$miClockIvl.DropDownItems.Add($item)
+    $script:miClockIvlItems[$mins] = $item
+}
+$menu.Items.AddRange(@(
+    $miTitle, $miReading, (New-Object System.Windows.Forms.ToolStripSeparator),
+    $miDash, $miTrends, $miRead, $miSync, (New-Object System.Windows.Forms.ToolStripSeparator),
+    $miConn, $miAranet, $miLog, $miAlerts, $miClockIvl, (New-Object System.Windows.Forms.ToolStripSeparator),
+    $miOpen, $miStartup, (New-Object System.Windows.Forms.ToolStripSeparator), $miExit))
+$script:ni.ContextMenuStrip = $menu
+
+# ---- timers ----
+$script:poll = New-Object System.Windows.Forms.Timer; $script:poll.Interval = 1000
+$script:poll.Add_Tick({ try { Poll-Jobs } catch { WLog "ERROR poll: $($_.Exception.Message)" } })
+$script:aranetForceTimer = New-Object System.Windows.Forms.Timer; $script:aranetForceTimer.Interval = 1000
+$script:aranetForceTimer.Add_Tick({ try { Aranet-ForceTick } catch {} })
+$script:sched = New-Object System.Windows.Forms.Timer; $script:sched.Interval = 5000
+$script:sched.Add_Tick({ try { Scheduler-Tick } catch { WLog "ERROR scheduler: $($_.Exception.Message)" } })
+$script:toastTimer = New-Object System.Windows.Forms.Timer; $script:toastTimer.Interval = 6000
+$script:toastTimer.Add_Tick({ $script:toastTimer.Stop(); $script:toast = $null; try { if ($script:dash -and $script:dash.Status) { $script:dash.Status.Invalidate() } } catch {} })
+# launching the widget a second time opens the dashboard of the one already running
+$script:showEvt = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'LYWSD02_Show_Dashboard')
+$script:showTimer = New-Object System.Windows.Forms.Timer; $script:showTimer.Interval = 1000
+$script:showTimer.Add_Tick({ try { if ($script:showEvt.WaitOne(0)) { Show-Dashboard } } catch {} })
+$script:kick = New-Object System.Windows.Forms.Timer; $script:kick.Interval = 1500
+$script:kick.Add_Tick({ $script:kick.Stop(); try { Scheduler-Tick } catch { WLog "ERROR first tick: $($_.Exception.Message)" } })
+$script:hide = New-Object System.Windows.Forms.Timer; $script:hide.Interval = 150
+$script:hide.Add_Tick({
+    try {
+        if (-not $script:popupShown) { $script:hide.Stop(); return }
+        $p = [System.Windows.Forms.Cursor]::Position
+        $b = $script:popup.Bounds; $b.Inflate(8,8)
+        $overPopup = $b.Contains($p)
+        if (-not $overPopup -and [System.Windows.Forms.Control]::MouseButtons -ne [System.Windows.Forms.MouseButtons]::None) { Hide-Popup; return }
+        $a = $script:popupAnchor
+        $nearAnchor = ([math]::Abs($p.X-$a.X) -le 40 -and [math]::Abs($p.Y-$a.Y) -le 40)
+        if (-not $overPopup -and -not $nearAnchor) { Hide-Popup }
+    } catch {}
 })
-# Hover shows the graph popup; double-click opens the resizable trends window.
+
+# ---- hover popup window ----
+$script:popup = New-Object Vulcan.NoActivatePopup
+$script:popup.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+$script:popup.ControlBox = $false; $script:popup.ShowInTaskbar = $false; $script:popup.TopMost = $true
+$script:popup.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+$script:popup.Size = New-Object System.Drawing.Size(384, 172)
+$script:popup.BackColor = $script:DashTheme.Canvas
+$script:popupPanel = New-Object Vulcan.CardPanel
+$script:popupPanel.Dock = [System.Windows.Forms.DockStyle]::Fill; $script:popupPanel.BackColor = $script:DashTheme.Canvas
+$script:popupPanel.Cursor = [System.Windows.Forms.Cursors]::Hand
+$script:popupPanel.Add_Paint({ param($s,$e); try { Rs-PaintPopup $e.Graphics $this } catch { WLog "rs popup: $($_.Exception.Message)" } })
+$script:popup.Controls.Add($script:popupPanel)
+$script:popupPanel.Add_Click({ Hide-Popup; Show-Dashboard })
+
+# ---- menu + tray handlers ----
+$miDash.Add_Click({ Show-Dashboard })
+$miTrends.Add_Click({ Show-TrendsWindow })
+$miRead.Add_Click({ Read-Now })
+$miSync.Add_Click({ Start-Bg -Kind 'sync' -LogCsv $false -Notify $true })
+$miConn.Add_Click({ Toggle-Connection })
+$miAranet.Add_Click({ Toggle-Aranet })
+$miLog.Add_Click({ $script:settings.HourlyLogging = -not $script:settings.HourlyLogging; Save-Settings; Refresh-Menu; Sync-DrawerControls })
+$miAlerts.Add_Click({ $script:settings.AlertsEnabled = -not $script:settings.AlertsEnabled; Save-Settings; Refresh-Menu; Sync-DrawerControls })
+$miOpen.Add_Click({ Start-Process explorer.exe $LogDir })
+$miStartup.Add_Click({ Set-Startup (-not (Test-Startup)); Refresh-Menu; Sync-DrawerControls })
+$miExit.Add_Click({ try { $script:ni.Visible = $false } catch {}; [System.Windows.Forms.Application]::Exit() })
+# Hover shows the summary; double-click opens the dashboard.
 $script:ni.Add_MouseMove({
     $cp = [System.Windows.Forms.Cursor]::Position
-    if ($script:popupShown) {
-        $script:popupAnchor = $cp
-    } elseif ([Environment]::TickCount -ge $script:suppressUntil) {
-        Show-Popup $cp.X $cp.Y
-    }
+    if ($script:popupShown) { $script:popupAnchor = $cp }
+    elseif ([Environment]::TickCount -ge $script:suppressUntil) { Show-Popup $cp.X $cp.Y }
 })
-# Clicking the icon (single or double) dismisses the popup and briefly suppresses
-# re-showing, so it doesn't immediately pop back while the cursor is still on the icon.
-$script:ni.Add_MouseDown({
-    $script:suppressUntil = [Environment]::TickCount + 900
-    Hide-Popup
-})
+$script:ni.Add_MouseDown({ $script:suppressUntil = [Environment]::TickCount + 900; Hide-Popup })
 $script:ni.Add_MouseDoubleClick({ Show-Dashboard })
 $menu.Add_Opening({ Hide-Popup })
 
+# ---- first paint: the last logged values, at once ----
+Seed-Readings
+# a restart should not trigger a clock read (and a battery hit) if one was logged moments ago
+if ($script:lastReading) { $due = $script:lastReading.When.AddMinutes((Clock-Interval)); if ($due -gt $script:clockDue) { $script:clockDue = $due } }
+Update-Icon '..' (-not $script:settings.ConnectionEnabled) 'good'
 Refresh-Menu
-# Honour the saved light/dark theme so the hover popup matches before the
-# dashboard is first opened.
-try { Apply-Theme $(if ($script:settings.Theme) { [string]$script:settings.Theme } else { 'dark' }) } catch {}
-try { Load-Ach } catch {}   # restore the last ventilation estimate so it survives restarts
-WLog "Widget started (addr='$($script:settings.Address)', interval=$($script:settings.IntervalMinutes)m, conn=$($script:settings.ConnectionEnabled))."
+Refresh-All
 
-# ---- Run ------------------------------------------------------------------
+if ($SelfTest) {
+    # Developer check: exercise every window against the real data and save screenshots.
+    $code = 0
+    try {
+        if (-not (Test-Path $SelfTest)) { New-Item -ItemType Directory -Force -Path $SelfTest | Out-Null }
+        $tag = $script:DashTheme.Mode
+        $shot = { param($ctl, $name, [bool]$screen)
+            [System.Windows.Forms.Application]::DoEvents()
+            if ($screen) {
+                Start-Sleep -Milliseconds 400; [System.Windows.Forms.Application]::DoEvents()
+                $b = $ctl.Bounds; $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+                $gg = [System.Drawing.Graphics]::FromImage($bmp); $gg.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size); $gg.Dispose()
+            } else {
+                $bmp = New-Object System.Drawing.Bitmap $ctl.Width, $ctl.Height
+                $ctl.DrawToBitmap($bmp, (New-Object System.Drawing.Rectangle(0, 0, $ctl.Width, $ctl.Height)))
+            }
+            $bmp.Save((Join-Path $SelfTest "$name-$tag.png"), [System.Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose() }
+        $t0 = [System.Diagnostics.Stopwatch]::StartNew()
+        Show-Dashboard
+        if (-not $script:dash) { throw 'dashboard did not open' }
+        $f = $script:dash.Form
+        if ($SelfTestSize -match '^(\d+)x(\d+)$') { $f.Size = New-Object System.Drawing.Size([int]$Matches[1], [int]$Matches[2]) }
+        $f.TopMost = $true; [System.Windows.Forms.Application]::DoEvents()
+        Write-Host ("SELFTEST core={0} rows={1} startup={2}ms dashboard-open={3}ms" -f $coreHow, $rowsLoaded, $swStart.ElapsedMilliseconds, $t0.ElapsedMilliseconds)
+        $t1 = [System.Diagnostics.Stopwatch]::StartNew(); Refresh-All; [System.Windows.Forms.Application]::DoEvents()
+        Write-Host ("SELFTEST refresh={0}ms verdict='{1}' alerts={2}" -f $t1.ElapsedMilliseconds, $script:rs.Verdict, $script:rs.Alerts.Count)
+        & $shot $f 'dashboard' $false
+        # a message in the status area, an alert strip, the settings drawer
+        Rs-Toast 'LYWSD02' ("25.4{0}C   58% RH   battery 56%" -f $script:RsDeg) 'info'
+        $script:rs.Alerts = @(@{ Level='caution'; Title=('CO' + $script:RsSub2 + ' is high'); Msg='1,460 ppm. Open a window or door.' }, @{ Level='info'; Title='Pressure dropping fast'; Msg='3.8 hPa in 3 h. Weather is likely turning.' })
+        $script:dash.Layout.RowStyles[1].Height = 46; foreach ($pnl in $script:dash.Panels) { $pnl.Invalidate() }
+        & $shot $f 'alerts' $false
+        Toggle-Drawer
+        & $shot $script:dash.Drawer 'drawer' $false
+        # drive the controls the way a click would (settings are not saved in a self-test)
+        $flags = [System.Reflection.BindingFlags]'Instance,NonPublic'
+        foreach ($k in 'Log', 'Alerts', 'Quiet') {
+            $c = $script:dash.Ctl[$k]; $before = [bool]$c.Checked
+            [void]$c.GetType().GetMethod('OnClick', $flags).Invoke($c, @([System.EventArgs]::Empty))
+            if ([bool]$c.Checked -eq $before) { throw "toggle $k did not flip" }
+            [void]$c.GetType().GetMethod('OnClick', $flags).Invoke($c, @([System.EventArgs]::Empty))
+        }
+        if (-not $script:settings.HourlyLogging -or -not $script:settings.AlertsEnabled) { throw 'toggles did not write back to settings' }
+        $seg = $script:dash.Ctl.Seg; $keepIvl = Clock-Interval
+        $me = New-Object System.Windows.Forms.MouseEventArgs([System.Windows.Forms.MouseButtons]::Left, 1, ($seg.Width - 10), 10, 0)
+        [void]$seg.GetType().GetMethod('OnMouseDown', $flags).Invoke($seg, [object[]]@($me.PSObject.BaseObject))
+        if ((Clock-Interval) -ne 60) { throw "interval selector gave $(Clock-Interval), expected 60" }
+        Set-ClockInterval $keepIvl
+        $keepName = [string]$script:settings.RoomName; $keepVol = [int]$script:settings.RoomVolume
+        $script:dash.Ctl.Vol.Value = 40; if ([int]$script:settings.RoomVolume -ne 40) { throw 'room volume did not apply' }
+        $script:dash.Ctl.Vol.Value = $keepVol
+        Toggle-Drawer
+        Begin-NameEdit; $script:dash.NameBox.Text = 'Study'; End-NameEdit $true
+        if ($script:settings.RoomName -ne 'Study' -or $script:dash.Form.Text -notlike '*Study*') { throw 'room rename did not apply' }
+        Set-RoomName $keepName
+        $modeBefore = $script:DashTheme.Mode; Toggle-Theme; [System.Windows.Forms.Application]::DoEvents()
+        if ($script:DashTheme.Mode -eq $modeBefore -or -not $script:dash) { throw 'theme toggle failed' }
+        Toggle-Theme; [System.Windows.Forms.Application]::DoEvents(); $f = $script:dash.Form
+        Write-Host 'SELFTEST interactions ok (toggles, interval, volume, rename, theme)'
+        $script:popup.Location = New-Object System.Drawing.Point(40, 40); $script:popup.Show()
+        & $shot $script:popupPanel 'popup' $false
+        $script:popup.Hide()
+        $t2 = [System.Diagnostics.Stopwatch]::StartNew(); Show-TrendsWindow; [System.Windows.Forms.Application]::DoEvents()
+        if (-not $script:trendForm) { throw 'trends window did not open' }
+        Write-Host ("SELFTEST trends-open={0}ms points={1}" -f $t2.ElapsedMilliseconds, $script:trendCo2Chart.Series['CO2'].Points.Count)
+        $script:trendForm.TopMost = $true
+        & $shot $script:trendForm 'trends' $false
+        $r = Get-ChartXRange $script:trendCo2Chart
+        $t3 = [System.Diagnostics.Stopwatch]::StartNew(); Zoom-Apply ($r.Max - 0.25) $r.Max; [System.Windows.Forms.Application]::DoEvents()
+        Write-Host ("SELFTEST zoom={0}ms points={1}" -f $t3.ElapsedMilliseconds, $script:trendCo2Chart.Series['CO2'].Points.Count)
+        & $shot $script:trendForm 'trends-zoom' $false
+        $script:trendForm.Close(); $f.Close()
+        Write-Host 'SELFTEST OK'
+    } catch { Write-Host "SELFTEST ERROR: $($_.Exception.Message) :: $($_.ScriptStackTrace)"; $code = 1 }
+    try { $script:ni.Dispose() } catch {}
+    exit $code
+}
+
+$script:ni.Visible = $true
+Stop-LegacyWatchers
+$script:sched.Start(); $script:kick.Start(); $script:showTimer.Start()
+WLog ("Widget started in {0} ms (core {1}, {2} rows of history, clock every {3} min, bluetooth {4})." -f $swStart.ElapsedMilliseconds, $coreHow, $rowsLoaded, (Clock-Interval), $script:settings.ConnectionEnabled)
+
+# ---- Run ----
 $ctx = New-Object System.Windows.Forms.ApplicationContext
 [System.Windows.Forms.Application]::Run($ctx)
 
-# Cleanup on exit
+# ---- Cleanup ----
+try { [void]$script:pauseEvt.Reset() } catch {}
 try { Stop-AranetWatcher } catch {}
-try { if ($script:iconHandle -ne [IntPtr]::Zero) { [void][LywsdNative.U32]::DestroyIcon($script:iconHandle) } } catch {}
-try { $script:ni.Dispose() } catch {}
+try { $script:ni.Visible = $false; $script:ni.Dispose() } catch {}
+try { if ($script:iconHandle -ne [IntPtr]::Zero) { [void][Vulcan.Native]::DestroyIcon($script:iconHandle) } } catch {}
 try { $script:mutex.ReleaseMutex() } catch {}
-WLog "Widget stopped."
+WLog 'Widget stopped.'

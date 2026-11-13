@@ -379,10 +379,19 @@ public static class LywsdClock {
 
 function Initialize-Helper {
     if (-not ([System.Management.Automation.PSTypeName]'LywsdClock').Type) {
-        $refs = Resolve-References
-        $cp = New-Object System.CodeDom.Compiler.CompilerParameters
-        foreach ($r in $refs) { [void]$cp.ReferencedAssemblies.Add($r) }
-        Add-Type -TypeDefinition $csharp -CompilerParameters $cp -ErrorAction Stop
+        # Compile once and reuse the cached DLL (logs\cache) on later runs: the widget
+        # launches this script for every clock read, so this saves a compiler run each time.
+        Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction Stop
+        $helper = Join-Path $ScriptDir 'Compile-Cache.ps1'
+        if (Test-Path $helper) {
+            . $helper
+            [void](Import-CachedAssembly -Name 'lywsd-clock' -Source $csharp -CacheDir (Join-Path $ScriptDir 'logs\cache') -ProbeType 'LywsdClock' -References { Resolve-References })
+        } else {
+            $refs = Resolve-References
+            $cp = New-Object System.CodeDom.Compiler.CompilerParameters
+            foreach ($r in $refs) { [void]$cp.ReferencedAssemblies.Add($r) }
+            Add-Type -TypeDefinition $csharp -CompilerParameters $cp -ErrorAction Stop
+        }
     }
 }
 
